@@ -21,6 +21,25 @@
 export const ARCH_WHISPER = 'whisper'
 export const ARCH_SHERPA = 'sherpa'
 
+/** 可执行文件后缀：Windows 带 .exe，macOS / Linux 无。引擎按平台选。 */
+const EXE_SUFFIX = process.platform === 'win32' ? '.exe' : ''
+
+const WHISPER_DEV_EXE =
+  process.platform === 'darwin'
+    ? [
+        'engine/build/metal/bin/xbaos-engine',
+        'engine/build/cpu/bin/xbaos-engine',
+      ]
+    : [
+        'engine/build/vulkan/bin/xbaos-engine.exe',
+        'engine/build/cpu/bin/xbaos-engine.exe',
+      ]
+
+const SHERPA_DEV_EXE =
+  process.platform === 'darwin'
+    ? ['engine-onnx/build/bin/xbaos-engine-asr']
+    : ['engine-onnx/build/bin/xbaos-engine-asr.exe']
+
 /**
  * 架构元数据。
  *
@@ -34,11 +53,8 @@ export const ARCH_INFO = {
     engine: 'whisper.cpp',
     /** 运行时与模型格式，模型页「架构」一栏的第二行 */
     runtime: 'GGML',
-    exe: 'xbaos-engine.exe',
-    devExe: [
-      'engine/build/vulkan/bin/xbaos-engine.exe',
-      'engine/build/cpu/bin/xbaos-engine.exe',
-    ],
+    exe: `xbaos-engine${EXE_SUFFIX}`,
+    devExe: WHISPER_DEV_EXE,
     envVar: 'XBAOS_ENGINE_EXE',
     /**
      * 能力开关。渲染层按它决定控件是否可用 —— 不要在各处重写这套判断，
@@ -59,8 +75,8 @@ export const ARCH_INFO = {
     id: ARCH_SHERPA,
     engine: 'sherpa-onnx',
     runtime: 'ONNX Runtime',
-    exe: 'xbaos-engine-asr.exe',
-    devExe: ['engine-onnx/build/bin/xbaos-engine-asr.exe'],
+    exe: `xbaos-engine-asr${EXE_SUFFIX}`,
+    devExe: SHERPA_DEV_EXE,
     envVar: 'XBAOS_ENGINE_ASR_EXE',
     caps: {
       // sherpa-onnx 的热词偏置只支持 transducer 模型且必须 modified_beam_search，

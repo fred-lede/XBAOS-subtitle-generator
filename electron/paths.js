@@ -5,7 +5,7 @@
  * 免得散落到各处后打包时才逐个爆雷。
  *
  * 开发态                     打包态
- * <repo>/engine/build/...    <resources>/engine/xbaos-engine.exe
+ * <repo>/engine/build/...    <resources>/engine/xbaos-engine[.exe]
  * <repo>/models/             <resources>/models/  与  <userData>/models/
  * <repo>/dist/               <resources>/app.asar/dist/
  */

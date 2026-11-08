@@ -110,6 +110,7 @@ import {
   normalizeStrength,
   strengthOption,
 } from '../src/data/scriptStrength'
+import { ARCH_INFO } from '../electron/model-catalog.js'
 import { parseReplaceDict, applyReplaceRules } from '../src/utils/dictReplace'
 import {
   allowedExternalUrl,
@@ -6084,6 +6085,31 @@ const OPT: PunctuationOptions = { zh: 'strip-split', en: 'keep' }
       readFileSync(new URL('../src/components/dialogs/ExportDialog.vue', import.meta.url), 'utf8'),
     ),
     '用户建的项目叫「小包听幕介绍」，导出来却叫「合并时间轴.srt」，还得手工改名',
+  )
+}
+
+/* ---- 引擎文件名按平台分叉（Task 3：mac 无 .exe，win 有 .exe） ---- */
+
+// 引擎可执行文件名必须按当前平台解析：mac 无 .exe，win 有 .exe。
+// 用 process.platform 在打包/开发时各自取值，这里只断言「当前平台拿到的是当前平台的后缀」，
+// 不假设打包机是 mac 还是 win。
+{
+  const isMac = process.platform === 'darwin'
+  const suffix = isMac ? '' : '.exe'
+  check(
+    '引擎文件名：whisper 按平台后缀',
+    ARCH_INFO.whisper.exe === `xbaos-engine${suffix}`,
+    ARCH_INFO.whisper.exe,
+  )
+  check(
+    '引擎文件名：sherpa 按平台后缀',
+    ARCH_INFO.sherpa.exe === `xbaos-engine-asr${suffix}`,
+    ARCH_INFO.sherpa.exe,
+  )
+  check(
+    '引擎 devExe：whisper 路径后缀与平台一致',
+    ARCH_INFO.whisper.devExe.every((p) => p.endsWith(suffix) || suffix === ''),
+    JSON.stringify(ARCH_INFO.whisper.devExe),
   )
 }
 
