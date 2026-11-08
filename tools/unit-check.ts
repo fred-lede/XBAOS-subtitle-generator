@@ -111,6 +111,7 @@ import {
   strengthOption,
 } from '../src/data/scriptStrength'
 import { ARCH_INFO } from '../electron/model-catalog.js'
+import { backendIntentToEngineBackend } from '../electron/backend-intent.js'
 import { parseReplaceDict, applyReplaceRules } from '../src/utils/dictReplace'
 import {
   allowedExternalUrl,
@@ -6110,6 +6111,47 @@ const OPT: PunctuationOptions = { zh: 'strip-split', en: 'keep' }
     '引擎 devExe：whisper 路径后缀与平台一致',
     ARCH_INFO.whisper.devExe.every((p) => p.endsWith(suffix) || suffix === ''),
     JSON.stringify(ARCH_INFO.whisper.devExe),
+  )
+}
+
+/* ---- 推理后端意图按平台映射 ---- */
+{
+  check(
+    'mac：whisper 的 vulkan 意图映射为 metal',
+    backendIntentToEngineBackend({ backend: 'vulkan', arch: 'whisper', isWindows: false }).backend === 'metal',
+  )
+  check(
+    'mac：whisper 的 cpu 意图映射为 cpu 且不禁 GPU',
+    (() => {
+      const r = backendIntentToEngineBackend({ backend: 'cpu', arch: 'whisper', isWindows: false })
+      return r.backend === 'cpu' && r.disableGpu === false
+    })(),
+  )
+  check(
+    'mac：whisper 的 auto 意图映射为 auto',
+    backendIntentToEngineBackend({ backend: 'auto', arch: 'whisper', isWindows: false }).backend === 'auto',
+  )
+  check(
+    'win：whisper 的 cpu 意图映射为 cpu 且需要禁 GPU',
+    (() => {
+      const r = backendIntentToEngineBackend({ backend: 'cpu', arch: 'whisper', isWindows: true })
+      return r.backend === 'cpu' && r.disableGpu === true
+    })(),
+  )
+  check(
+    'win：whisper 的 vulkan 意图映射为 vulkan',
+    backendIntentToEngineBackend({ backend: 'vulkan', arch: 'whisper', isWindows: true }).backend === 'vulkan',
+  )
+  check(
+    'win：envForced 时 vulkan 意图被纠正为 cpu',
+    backendIntentToEngineBackend({
+      backend: 'vulkan', arch: 'whisper', isWindows: true, envForced: true,
+    }).backend === 'cpu',
+  )
+  check(
+    'sherpa：任何平台任何意图都只走 cpu',
+    backendIntentToEngineBackend({ backend: 'vulkan', arch: 'sherpa', isWindows: true }).backend === 'cpu' &&
+      backendIntentToEngineBackend({ backend: 'vulkan', arch: 'sherpa', isWindows: false }).backend === 'cpu',
   )
 }
 

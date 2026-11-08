@@ -38,6 +38,7 @@ import {
   findCatalog,
   publicCatalog,
 } from './model-catalog.js'
+import { backendIntentToEngineBackend } from './backend-intent.js'
 import { clearArchCache, listModels, resolveModel } from './models.js'
 import { MANIFEST_URL, allowedExternalUrl, checkForUpdate, isAllowedExternalHost } from './update.js'
 import {
@@ -420,6 +421,8 @@ function readVulkanDisabled() {
 }
 
 function writeVulkanDisabled(value) {
+  // 该状态只服务于 Windows 的 Vulkan 禁用；macOS 上不写这个文件
+  if (process.platform !== 'win32') return Promise.resolve()
   fs.mkdir(path.dirname(engineStatePath()), { recursive: true })
     .then(() => fs.writeFile(engineStatePath(), JSON.stringify({ vulkanDisabled: value === true }, null, 2)))
     .catch(() => {
@@ -435,6 +438,8 @@ function writeVulkanDisabled(value) {
  * 否则界面会显示「自动（GPU）」而引擎实际在跑 CPU。
  */
 function envDisablesVulkan() {
+  // 该开关只对 Windows 的 Vulkan 构建有意义；macOS 的 Metal 不受它控制
+  if (process.platform !== 'win32') return false
   return typeof process.env.GGML_DISABLE_VULKAN === 'string'
 }
 
@@ -449,6 +454,8 @@ function envDisablesVulkan() {
  * 只在崩溃/导出诊断时跑一次，多进程开销无所谓。
  */
 async function readVulkanLayers() {
+  // Vulkan 隐式层是 Windows 注册表概念，macOS/Linux 上没有，直接返回空
+  if (process.platform !== 'win32') return {}
   const targets = [
     ['HKLM', 'SOFTWARE\\Khronos\\Vulkan\\ImplicitLayers'],
     ['HKCU', 'SOFTWARE\\Khronos\\Vulkan\\ImplicitLayers'],
@@ -486,11 +493,16 @@ async function readVulkanLayers() {
 
 /** 把 Windows 退出码翻译成人话，省得每次都要去查 */
 function describeExitCode(code) {
+  // Windows 退出码（NTSTATUS）翻译；非 Windows 平台用通用描述
+  if (typeof code === 'number' && process.platform === 'win32') {
+    if (code === 0) return '正常退出'
+    if (code === 3221225477) return '0xC0000005 访问违例（原生崩溃）'
+    if (code === 3221225781) return '0xC0000135 缺少依赖 DLL'
+    if (code === 3221225595) return '0xC000007B 映像格式不匹配（位数或 DLL 损坏）'
+    return `0x${(code >>> 0).toString(16).toUpperCase()}`
+  }
   if (code === 0) return '正常退出'
-  if (code === 3221225477) return '0xC0000005 访问违例（原生崩溃）'
-  if (code === 3221225781) return '0xC0000135 缺少依赖 DLL'
-  if (code === 3221225595) return '0xC000007B 映像格式不匹配（位数或 DLL 损坏）'
-  if (typeof code === 'number') return `0x${(code >>> 0).toString(16).toUpperCase()}`
+  if (typeof code === 'number') return `退出码 ${code}`
   return '(无退出码)'
 }
 
@@ -601,38 +613,26 @@ async function ensureEngineFor(arch) {
 }
 
 /**
- * 把界面上的「推理后端」意图落到引擎进程上。
+ * 把界面上的「推理后端」意图落到引擎进程上（applyBackendIntent 的薄封装）。
  *
- * ⚠ `backend: 'cpu'` 只传参数是**不够的**。引擎里那个判断只影响 whisper 的
- * `use_gpu`，而 ggml 的 Vulkan 后端是在注册表构造时无条件初始化的
- * （`ggml-backend-reg.cpp` 的 `#ifdef GGML_USE_VULKAN`），跟 use_gpu 无关。
- * 要真正避开 Vulkan，只能在 spawn 时给 `GGML_DISABLE_VULKAN=1`；那是环境
- * 变量，进程跑起来就改不了，所以这里可能需要重启引擎。
- *
- * 显式选 vulkan/gpu 时反过来做：把上次崩溃记下的禁用清掉，给用户一次机会。
+ * 决策本身在纯函数 backendIntentToEngineBackend（electron/backend-intent.js）
+ * 里；这里只负责真正需要重启/写盘的动作：win 上 setDisableVulkan 与
+ * writeVulkanDisabled。mac 上 disableGpu 恒为 false，这两个动作都不会发生。
  */
 async function applyBackendIntent(client, backend, arch = ARCH_WHISPER) {
-  /*
-   * ONNX 引擎只有 onnxruntime 的 CPU provider，上面那套 Vulkan 环境变量
-   * 对它毫无意义 —— 直接按 cpu 回，不去动 whisper 那边记的状态。
-   */
-  if (arch !== ARCH_WHISPER) return 'cpu'
-
-  if (backend === 'cpu') {
-    if (!client.disableVulkan) await client.setDisableVulkan(true)
-    return 'cpu'
+  const result = backendIntentToEngineBackend({
+    backend,
+    arch,
+    isWindows: process.platform === 'win32',
+    gpuDisabled: client.disableVulkan,
+    envForced: envDisablesVulkan(),
+  })
+  if (result.disableGpu && !client.disableVulkan) await client.setDisableVulkan(true)
+  if (!result.disableGpu && client.disableVulkan) {
+    await client.setDisableVulkan(false)
+    writeVulkanDisabled(false)
   }
-  if (backend === 'vulkan' || backend === 'gpu') {
-    // 系统环境变量是外部强制的全局覆盖，界面改不动它
-    if (envDisablesVulkan()) return 'cpu'
-    if (client.disableVulkan) {
-      await client.setDisableVulkan(false)
-      writeVulkanDisabled(false)
-    }
-    return 'vulkan'
-  }
-  // auto：尊重上次降级的结果，不主动再撞一次
-  return client.disableVulkan ? 'cpu' : 'auto'
+  return result.backend
 }
 
 // ---------------------------------------------------------------- 外观偏好
