@@ -107,13 +107,26 @@ mac:
       arch: [x64, arm64]
   # tools/make-icons.py 生成（mac 机走 iconutil，非 mac 机回退手写 icns 容器）
   icon: build/icon.icns
-  # 识别引擎（mac 侧，无后缀）。GGML 引擎是 Metal+CPU 版；
-  # ONNX 引擎需要 sherpa-onnx 依赖链先落地（Task 2）。
+  # 识别引擎（mac 侧，无后缀）。
+  #
+  # 与 Windows 不同：mac 的 ONNX 引擎是**动态链接**的 —— 它通过 @rpath 依赖
+  # libsherpa-onnx-c-api.dylib 与 libonnxruntime.dylib（sherpa 的 osx 预编译
+  # 库），所以这两个 dylib 必须一并随包，引擎才会真正能跑起来。
+  # GGML 引擎（whisper.cpp）是自包含单文件，无需额外 dylib。
   extraResources:
     - from: engine/build/metal/bin/xbaos-engine
       to: engine/xbaos-engine
     - from: engine-onnx/build/bin/xbaos-engine-asr
       to: engine/xbaos-engine-asr
+    # ONNX 引擎运行时依赖的两个 dylib（lib/ 下，按实际构建产物补齐；
+    # onnxruntime dylib 来自 sherpa 的 osx 预编译包，构建后落在 build 目录）
+    - from: engine-onnx/build/lib/libsherpa-onnx-c-api.dylib
+      to: engine/libsherpa-onnx-c-api.dylib
+    - from: engine-onnx/build/_deps/onnxruntime-src/lib/libonnxruntime.dylib
+      to: engine/libonnxruntime.dylib
+    # 二进制与 dylib 放到同一个 Resources/engine/ 目录后，引擎的 @rpath
+    # 指向其所在目录（$ORIGIN 之外的绝对 rpath 失效）—— 打包态下
+    # 实际由引擎可执行文件同目录的 dylib 兜底。
   # 未签名：关闭 signing 与公证。首次打开需「右键 → 打开」绕过 Gatekeeper
   identity: null
   notarize: false
