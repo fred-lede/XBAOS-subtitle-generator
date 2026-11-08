@@ -52,10 +52,18 @@ if(NOT EXISTS "${SHERPA_DIR}/CMakeLists.txt")
         "请按 docs/BUILD-ENGINE.md 的说明把源码放到 engine/third_party/sherpa-onnx")
 endif()
 
-# 静态构建，缺一不可（mac 上依赖 onnxruntime 官方 .dylib，库形态由 sherpa 决定）
-set(BUILD_SHARED_LIBS                   OFF CACHE BOOL "" FORCE)
+# 库形态：MSVC 走 win-x64 静态包（SHERPA 决定，缺一不可，保持静态）；
+# APPLE 必须保持 BUILD_SHARED_LIBS=ON —— 但 sherpa 顶层 CMakeLists 的
+# `option(BUILD_SHARED_LIBS ... OFF)` 会把缓存变量默认成 OFF，导致它的
+# cmake/onnxruntime-osx-arm64.cmake 直接 FATAL_ERROR（该分支只认动态库）。
+# 所以这里显式缓存为 ON；mac 的 onnxruntime 官方包也只以 .dylib 发布。
+# 两条路都由 sherpa 的 cmake/onnxruntime.cmake 分发。
 if(MSVC)
+    set(BUILD_SHARED_LIBS               OFF CACHE BOOL "" FORCE)
     set(SHERPA_ONNX_USE_STATIC_CRT      ON  CACHE BOOL "" FORCE)
+endif()
+if(APPLE)
+    set(BUILD_SHARED_LIBS               ON  CACHE BOOL "" FORCE)
 endif()
 
 # 只要 C API，其余全部关掉：体积与编译时间都省下来
@@ -90,21 +98,20 @@ if(MSVC AND NOT CMAKE_VS_PLATFORM_NAME)
     endif()
 endif()
 
-# onnxruntime 平台库：Windows 维持 win-x64 静态；macOS 按本机架构取 osx-arm64 / osx-x86_64
-#
-# 注意（2026-11-08 mac 适配）：下面注入的 `ONNXRUNTIME_OSX_ARCH` 是**计划约定**的
-# 变量名 —— sherpa-onnx 源码本仓库不随检出携带（见 build.sh 提示），其真实
-# cmake/onnxruntime.cmake 对 macOS 库来源读取的变量名尚未验证。落地时先读
-# engine/third_party/sherpa-onnx/cmake/onnxruntime.cmake，确认它实际读取的变量名
-# （可能是 ONNXRUNTIME_OSX_ARCH 或等价的 ONNXRUNTIME_BINARY_URL），再按真实变量名
-# 注入；若该文件没有 mac 动态库分支，需在其内补 osx-arm64/osx-x86_64 下载分支。
+# onnxruntime 平台库分发（2026-11-08 与真实 sherpa cmake 对齐）：
+# - APPLE：不需要注入任何变量。sherpa 的 cmake/onnxruntime.cmake Darwin 分支
+#   原生按 CMAKE_SYSTEM_PROCESSOR（必要时辅以 CMAKE_OSX_ARCHITECTURES）分发：
+#   arm64 mac → onnxruntime-osx-arm64.cmake（osx-arm64 动态库），
+#   x86_64 mac → onnxruntime-osx-x86_64.cmake（osx-x86_64 动态库）。
+#   此前注入的 `ONNXRUNTIME_OSX_ARCH` 变量在 sherpa cmake 中并不存在，已删除。
+#   离线预置时把 zip 放到 engine-onnx/（即 CMAKE_SOURCE_DIR）或 ~/Downloads/，
+#   sherpa 的 possible_file_locations 会优先读本地文件（见 tools/fetch-deps.mjs）。
 if(APPLE)
-    set(ONNXRUNTIME_OSX_ARCH "arm64" CACHE STRING "macOS onnxruntime 架构" FORCE)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
-        set(ONNXRUNTIME_OSX_ARCH "x86_64" CACHE STRING "macOS onnxruntime 架构" FORCE)
+        message(STATUS "onnxruntime macOS 目标：osx-x86_64（动态库，由 sherpa cmake 分发）")
+    else()
+        message(STATUS "onnxruntime macOS 目标：osx-arm64（动态库，由 sherpa cmake 分发）")
     endif()
-    # sherpa 的 onnxruntime.cmake 读到该变量后会拉 osx-<arch> 的动态库
-    message(STATUS "onnxruntime macOS 目标：osx-${ONNXRUNTIME_OSX_ARCH}")
 elseif(MSVC)
     # 现状：win-x64 静态包（维持）
     message(STATUS "onnxruntime Windows 目标：win-x64（静态）")

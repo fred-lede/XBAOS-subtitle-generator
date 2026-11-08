@@ -135,31 +135,47 @@ for (const [name, url] of jobs) {
 }
 
 /**
- * onnxruntime macOS 预编译库（GitHub release 资产，不是源码归档，codeload 规则不适用）：
- *   arm64 取 onnxruntime-osx-arm64-<ver>.tar.gz（资产名不含 -osx-arm64 二次后缀）
- *   x64   取 onnxruntime-osx-x86_64-<ver>.tar.gz
- * 落到项目根目录（mac 上默认 engine-onnx/），sherpa 的 onnxruntime.cmake 会优先读本地文件。
- *
- * ⚠ 变量名与版本未与 sherpa 真实 cmake 对齐：落地时读
- * engine/third_party/sherpa-onnx/cmake/onnxruntime.cmake 里的实际变量与版本号，
- * 再决定是否保留本块（也可能由 sherpa cmake 自行下载，此块仅作离线预置）。
+ * onnxruntime macOS 预编译库（与 sherpa 真实 cmake 对齐，2026-11-08 验证）：
+ *   资产是 csukuangfj/onnxruntime-libs 的 GitHub release .zip（不是源码归档，
+ *   也不走 codeload 规则）：
+ *     arm64  → onnxruntime-osx-arm64-1.28.2.zip
+ *     x86_64 → onnxruntime-osx-x86_64-1.28.2.zip
+ *   只有 darwin 上需要（Windows 开发机走 win-x64 静态包，不跑本块）。
+ * 落到项目根目录（mac 上默认 engine-onnx/，即 CMAKE_SOURCE_DIR）：
+ * sherpa 的 cmake/onnxruntime-osx-arm64.cmake 的 possible_file_locations
+ * 优先检查 ${CMAKE_SOURCE_DIR}/onnxruntime-osx-arm64-1.28.2.zip。
+ * 下载后做 SHA256 校验，与 sherpa cmake 里的 onnxruntime_HASH 完全一致。
  */
-const ORT_VERSION = '1.17.0' // 与 sherpa 当前依赖的 onnxruntime 版本对齐（未验证）
-const ortBase = process.arch === 'arm64' ? 'osx-arm64' : 'osx-x86_64'
-const ortZip = `onnxruntime-${ortBase}-${ORT_VERSION}.tar.gz`
-const ortUrl = `https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${ortZip}`
-const ortTarget = path.join(root, ortZip)
-if (!fs.existsSync(ortTarget) || fs.statSync(ortTarget).size <= 1024) {
-  process.stdout.write(`下载 onnxruntime  ${ortZip} … `)
-  try {
-    execFileSync('curl', ['-sL', '--noproxy', '*', '--max-time', '600', '-o', ortTarget, ortUrl], {
-      stdio: 'ignore',
-    })
-    const size = fs.statSync(ortTarget).size
-    console.log(`${(size / 1048576).toFixed(1)} MB`)
-  } catch {
-    console.log('失败')
-    failed++
+if (process.platform === 'darwin') {
+  const ORT_VERSION = '1.28.2' // 与 sherpa-onnx/cmake/onnxruntime-osx-*.cmake 对齐
+  const ortArch = process.arch === 'arm64' ? 'arm64' : 'x86_64'
+  const ortZip = `onnxruntime-osx-${ortArch}-${ORT_VERSION}.zip`
+  const ortHash =
+    ortArch === 'arm64'
+      ? 'd9e5c0c79929e201f5b8eb095e6809a91ce78be9866a1bca0dfab7e20b40ae40'
+      : 'cef42f2a4fca3b23dd16914ead36229adc7d5c119d563aaa12cc5d1e9177f93d'
+  const ortUrl = `https://github.com/csukuangfj/onnxruntime-libs/releases/download/v${ORT_VERSION}/${ortZip}`
+  const ortTarget = path.join(root, ortZip)
+  if (!fs.existsSync(ortTarget) || fs.statSync(ortTarget).size <= 1024) {
+    process.stdout.write(`下载 onnxruntime  ${ortZip} … `)
+    try {
+      execFileSync('curl', ['-sL', '--noproxy', '*', '--max-time', '600', '-o', ortTarget, ortUrl], {
+        stdio: 'ignore',
+      })
+      // SHA256 校验，与 sherpa cmake 的 URL_HASH 一致；不通过就删掉记失败
+      const hashOut = execFileSync('sh', ['-c', `shasum -a 256 "${ortTarget}" | awk '{print $1}'`], {
+        encoding: 'utf8',
+      }).trim()
+      if (hashOut !== ortHash) {
+        throw new Error(`SHA256 不匹配：期望 ${ortHash}，实际 ${hashOut}`)
+      }
+      const size = fs.statSync(ortTarget).size
+      console.log(`${(size / 1048576).toFixed(1)} MB（SHA256 校验通过）`)
+    } catch (e) {
+      console.log(`失败（${e instanceof Error ? e.message : e}）`)
+      try { fs.rmSync(ortTarget, { force: true }) } catch {}
+      failed++
+    }
   }
 }
 
