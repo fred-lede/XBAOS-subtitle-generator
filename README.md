@@ -26,6 +26,14 @@
 
 Windows 安装包见官网：<https://subtitle.xbaos.com.cn>
 
+macOS 版（未签名 dmg，x64 与 arm64 各一份）见官网：https://subtitle.xbaos.com.cn
+
+> **首次打开提示**：macOS 版当前**未经 Apple 代码签名与公证**。
+> 从官网下载 dmg 后，双击装入 `/Applications`；**第一次**启动时系统会提示
+> 「无法打开，因为无法验证开发者」。处理方式：在访达里对该 app 图标
+> **右键 → 打开**，在弹窗里再点一次「打开」即可，此后正常双击就能启动。
+> 这不是安装损坏，是未签名的正常现象（见下方「开发版获取」）。
+
 版本变更记录见[更新日志](https://subtitle.xbaos.com.cn/changelog.html)。
 
 安装包**不含**识别模型。首次启动会进入模型管理页：下载一个（最小的约 140 MB），
@@ -46,10 +54,10 @@ Windows 安装包见官网：<https://subtitle.xbaos.com.cn>
 
 | 项目 | 要求 |
 |---|---|
-| 系统 | Windows 10 / 11（64 位） |
-| 显卡 | 无要求。支持 Vulkan 的显卡会自动走 GPU，否则用 CPU |
+| 系统 | Windows 10 / 11（64 位）或 macOS 12 及以上（x64 与 Apple Silicon 均支持） |
+| 显卡 | Windows：支持 Vulkan 的显卡自动走 GPU，否则用 CPU。macOS：Apple GPU 走 Metal，否则用 CPU |
 | 磁盘 | 安装后约 415 MB。识别模型需另行获取（约 140 MB ~ 1.6 GB，取决于所选档位） |
-| 权限 | 不需要管理员权限，安装到用户目录即可 |
+| 权限 | Windows 不需管理员；macOS 未签名版首次打开需右键「打开」绕过 Gatekeeper |
 
 毛玻璃标题栏需要 Windows 11 22H2 及以上，其余环境自动退回纯色。
 
@@ -164,6 +172,25 @@ npm run probe:electron # Electron 端到端探针（界面 + preload 桥 + 引�
 npm run dist:dir      # 只生成解包目录，快，用于验证
 npm run dist          # 生成 NSIS 安装程序
 ```
+
+### macOS（未签名 dmg）
+
+引擎（mac 需先有 cmake 与 ninja：`brew install cmake ninja`，clang 随 Xcode 自带）：
+
+```bash
+bash engine/fetch-deps.sh         # whisper.cpp 源码
+bash engine/build.sh metal        # GGML 引擎（Metal + CPU 单二进制）
+bash engine-onnx/build.sh         # ONNX 引擎（onnxruntime 自动取 osx 库）
+```
+
+打包（未签名，双架构 dmg）：
+
+```bash
+npm run dist:mac
+```
+
+产物在 `release/`：`小包听幕-<版本>-x64.dmg` 与 `小包听幕-<版本>-arm64.dmg`。
+未签名与公证是**有意省略**的后续步骤（需要 Apple 开发者账号），当前 dmg 供本地与测试使用。
 
 ### 预览参数（仅开发模式生效）
 

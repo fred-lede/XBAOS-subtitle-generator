@@ -5,6 +5,11 @@
 #      含 H.264 / AAC 的 ffmpeg 换成纯开源编解码版本）
 #   2. 不含任何需要单独授权的第三方组件。识别引擎是 /MT 静态链接，
 #      不依赖 vcruntime140.dll 之类的微软运行时
+#
+# 遵循一条 macOS 口径：
+# 4. macOS 版当前未签名、未公证（identity: null / notarize: false），
+#    首次打开需「右键 → 打开」绕过 Gatekeeper；Developer ID 签名与公证
+#    是后续单独任务，不在本次范围内
 
 appId: com.xbaos.subtitle-generator
 productName: 小包听幕
