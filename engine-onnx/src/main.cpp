@@ -207,7 +207,11 @@ struct Cue {
 /** 目录里找一个存在的文件，找不到返回空串 */
 std::string pickFile(const std::string &dir, std::initializer_list<const char *> names) {
     for (const char *name : names) {
+#if defined(_WIN32)
         std::string full = dir + "\\" + name;
+#else
+        std::string full = dir + "/" + name;
+#endif
         if (FILE *f = std::fopen(full.c_str(), "rb")) {
             std::fclose(f);
             return full;

@@ -1,9 +1,10 @@
 # ============================================================================
 #  XBAOS 字幕生成器 —— ONNX 识别引擎
 #
-#  产物：xbaos-engine-asr.exe
+#  产物：
+#     · Windows：xbaos-engine-asr.exe（/MT 静态链接 C 运行时，onnxruntime 静态链接，发布包零外部 DLL）
+#     · macOS  ：xbaos-engine-asr（无后缀，AppleClang + 系统库，onnxruntime 官方 osx 动态库）
 #     · 与 whisper 引擎并列的第二套识别后端（sherpa-onnx + SenseVoice 等）
-#     · /MT 静态链接 C 运行时，onnxruntime 同样静态链接，发布包零外部 DLL
 #     · 复用 ../engine/src 下的音频解码、VAD 与 JSON 工具，不重复造轮子
 #
 #  用法（在项目根目录执行）：
@@ -17,8 +18,8 @@ project(xbaos-engine-asr
     DESCRIPTION "XBAOS 字幕生成器 ONNX 识别引擎"
     LANGUAGES C CXX)
 
-if(NOT MSVC)
-    message(FATAL_ERROR "本引擎只支持 MSVC 工具链（需要 /MT 静态链接）。")
+if(NOT MSVC AND NOT APPLE)
+    message(FATAL_ERROR "本引擎支持 MSVC（Windows）与 AppleClang（macOS）工具链。当前编译器：${CMAKE_CXX_COMPILER_ID}")
 endif()
 
 set(CMAKE_CXX_STANDARD 17)
@@ -29,11 +30,13 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "构建类型" FORCE)
 endif()
 
-add_compile_options(/utf-8)
+if(MSVC)
+    add_compile_options(/utf-8)
 
-# 静态 C 运行时：与 whisper 引擎同一条硬约束
-set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
-    CACHE STRING "MSVC 运行时库" FORCE)
+    # 静态 C 运行时：与 whisper 引擎同一条硬约束
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+        CACHE STRING "MSVC 运行时库" FORCE)
+endif()
 
 # ---------------------------------------------------------------------------
 #  sherpa-onnx 源码与依赖
@@ -49,9 +52,11 @@ if(NOT EXISTS "${SHERPA_DIR}/CMakeLists.txt")
         "请按 docs/BUILD-ENGINE.md 的说明把源码放到 engine/third_party/sherpa-onnx")
 endif()
 
-# 静态构建 + 静态 CRT，缺一不可
+# 静态构建，缺一不可（mac 上依赖 onnxruntime 官方 .dylib，库形态由 sherpa 决定）
 set(BUILD_SHARED_LIBS                   OFF CACHE BOOL "" FORCE)
-set(SHERPA_ONNX_USE_STATIC_CRT          ON  CACHE BOOL "" FORCE)
+if(MSVC)
+    set(SHERPA_ONNX_USE_STATIC_CRT      ON  CACHE BOOL "" FORCE)
+endif()
 
 # 只要 C API，其余全部关掉：体积与编译时间都省下来
 set(SHERPA_ONNX_ENABLE_C_API            ON  CACHE BOOL "" FORCE)
@@ -76,12 +81,33 @@ set(FETCHCONTENT_FULLY_DISCONNECTED     OFF CACHE BOOL "" FORCE)
 
 # Ninja 不会设置 CMAKE_VS_PLATFORM_NAME，而 onnxruntime 的预编译包靠它判断是否为
 # x64 静态包；不补这一项，配置阶段会直接 FATAL_ERROR。只影响这套判断，不改编译器。
-if(NOT CMAKE_VS_PLATFORM_NAME)
+# 仅 MSVC 需要：mac（Ninja + AppleClang）不走 win 分支，误设 X64 会选到 win 包。
+if(MSVC AND NOT CMAKE_VS_PLATFORM_NAME)
     if(CMAKE_SIZEOF_VOID_P EQUAL 8)
         set(CMAKE_VS_PLATFORM_NAME X64)
     else()
         set(CMAKE_VS_PLATFORM_NAME Win32)
     endif()
+endif()
+
+# onnxruntime 平台库：Windows 维持 win-x64 静态；macOS 按本机架构取 osx-arm64 / osx-x86_64
+#
+# 注意（2026-11-08 mac 适配）：下面注入的 `ONNXRUNTIME_OSX_ARCH` 是**计划约定**的
+# 变量名 —— sherpa-onnx 源码本仓库不随检出携带（见 build.sh 提示），其真实
+# cmake/onnxruntime.cmake 对 macOS 库来源读取的变量名尚未验证。落地时先读
+# engine/third_party/sherpa-onnx/cmake/onnxruntime.cmake，确认它实际读取的变量名
+# （可能是 ONNXRUNTIME_OSX_ARCH 或等价的 ONNXRUNTIME_BINARY_URL），再按真实变量名
+# 注入；若该文件没有 mac 动态库分支，需在其内补 osx-arm64/osx-x86_64 下载分支。
+if(APPLE)
+    set(ONNXRUNTIME_OSX_ARCH "arm64" CACHE STRING "macOS onnxruntime 架构" FORCE)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+        set(ONNXRUNTIME_OSX_ARCH "x86_64" CACHE STRING "macOS onnxruntime 架构" FORCE)
+    endif()
+    # sherpa 的 onnxruntime.cmake 读到该变量后会拉 osx-<arch> 的动态库
+    message(STATUS "onnxruntime macOS 目标：osx-${ONNXRUNTIME_OSX_ARCH}")
+elseif(MSVC)
+    # 现状：win-x64 静态包（维持）
+    message(STATUS "onnxruntime Windows 目标：win-x64（静态）")
 endif()
 
 add_subdirectory("${SHERPA_DIR}" "${CMAKE_BINARY_DIR}/sherpa-onnx" EXCLUDE_FROM_ALL)
@@ -96,7 +122,9 @@ if(EXISTS "${XBAOS_OPUS_DIR}/CMakeLists.txt")
     set(OPUS_BUILD_TESTING       OFF CACHE BOOL "" FORCE)
     set(OPUS_BUILD_PROGRAMS      OFF CACHE BOOL "" FORCE)
     set(OPUS_INSTALL_PKG         OFF CACHE BOOL "" FORCE)
-    set(OPUS_STATIC_RUNTIME      ON  CACHE BOOL "" FORCE)
+    if(MSVC)
+        set(OPUS_STATIC_RUNTIME    ON  CACHE BOOL "" FORCE)
+    endif()
     set(OPUS_DISABLE_INTRINSICS  ON  CACHE BOOL "" FORCE)
     add_subdirectory("${XBAOS_OPUS_DIR}" "${CMAKE_BINARY_DIR}/opus" EXCLUDE_FROM_ALL)
     set(XBAOS_HAS_OPUS 1)
@@ -136,7 +164,9 @@ set_target_properties(xbaos-engine-asr PROPERTIES
 message(STATUS "")
 message(STATUS "============== xbaos-engine-asr 配置 ==============")
 message(STATUS "  构建类型    : ${CMAKE_BUILD_TYPE}")
-message(STATUS "  MSVC 运行时 : ${CMAKE_MSVC_RUNTIME_LIBRARY}")
+if(MSVC)
+    message(STATUS "  MSVC 运行时 : ${CMAKE_MSVC_RUNTIME_LIBRARY}")
+endif()
 message(STATUS "  sherpa-onnx : ${SHERPA_DIR}")
 message(STATUS "  Opus 解码   : ${XBAOS_HAS_OPUS}")
 message(STATUS "==================================================")

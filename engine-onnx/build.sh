@@ -6,7 +6,9 @@
 #      bash engine-onnx/build.sh          # 构建
 #      bash engine-onnx/build.sh clean    # 清掉构建目录
 #
-#  产物：engine-onnx/build/bin/xbaos-engine-asr.exe
+#  产物：
+#      Windows：engine-onnx/build/bin/xbaos-engine-asr.exe
+#      macOS  ：engine-onnx/build/bin/xbaos-engine-asr（无后缀）
 #
 #  前置：
 #    · engine/third_party/sherpa-onnx/  源码（含预置的依赖 tar 包）
@@ -15,7 +17,8 @@
 #  依赖包必须预置在源码根目录，构建过程不联网 —— 国内直连 github 通常不通，
 #  这是整个流程能否走通的关键。包名与哈希见该目录下的 *.cmake。
 #  缺什么就补什么：node tools/fetch-deps.mjs engine-onnx 会扫 build/_deps 里的
-#  FetchContent 声明，把 github 归档换成 codeload 直连拉下来。
+#  FetchContent 声明，把 github 归档换成 codeload 直连拉下来；mac 上还会顺带
+#  下载本机架构的 onnxruntime 官方库（osx-arm64 / osx-x86_64）。
 #  说话人分离专用的 hclust-cpp（分层聚类）只有打开 diarization 时才需要，
 #  最容易漏，见 engine/third_party/sherpa-onnx/cmake/hclust-cpp.cmake。
 # ============================================================================
@@ -34,21 +37,32 @@ if [ "${1:-}" = "clean" ]; then
     exit 0
 fi
 
-# 载入 MSVC / CMake / Ninja 环境
-# shellcheck disable=SC1091
-source "$SCRIPT_DIR/../engine/env.sh" > /dev/null
-
 if [ ! -f engine/third_party/sherpa-onnx/CMakeLists.txt ]; then
     echo "错误：找不到 engine/third_party/sherpa-onnx" >&2
     exit 1
 fi
 
-cmake -S engine-onnx -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build "$BUILD_DIR"
+if [ "$(uname -s)" = "Darwin" ]; then
+    # macOS：系统 clang + CMake + Ninja（brew install cmake ninja 或 Xcode 自带 clang）
+    if ! command -v cmake > /dev/null 2>&1; then
+        echo "错误：找不到 cmake（brew install cmake ninja）" >&2
+        exit 1
+    fi
+    cmake -S engine-onnx -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release
+    cmake --build "$BUILD_DIR"
+else
+    # Windows（Git Bash）：载入 MSVC / CMake / Ninja 环境
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/../engine/env.sh" > /dev/null
+    cmake -S engine-onnx -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release
+    cmake --build "$BUILD_DIR"
+fi
 
-EXE="$BUILD_DIR/bin/xbaos-engine-asr.exe"
+# 产物按平台后缀判定：mac 无后缀，Windows 是 .exe
+EXE="$BUILD_DIR/bin/xbaos-engine-asr"
+[ "$(uname -s)" = "Darwin" ] || EXE="$EXE.exe"
 if [ -f "$EXE" ]; then
-    SIZE=$(stat -c%s "$EXE" 2>/dev/null || echo 0)
+    SIZE=$(stat -f%z "$EXE" 2>/dev/null || stat -c%s "$EXE" 2>/dev/null || echo 0)
     echo ""
     echo "构建完成：$EXE"
     printf "产物大小：%.1f MB\n" "$(echo "$SIZE / 1048576" | bc -l 2>/dev/null || echo 0)"

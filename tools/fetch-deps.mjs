@@ -134,4 +134,33 @@ for (const [name, url] of jobs) {
   }
 }
 
+/**
+ * onnxruntime macOS 预编译库（GitHub release 资产，不是源码归档，codeload 规则不适用）：
+ *   arm64 取 onnxruntime-osx-arm64-<ver>.tar.gz（资产名不含 -osx-arm64 二次后缀）
+ *   x64   取 onnxruntime-osx-x86_64-<ver>.tar.gz
+ * 落到项目根目录（mac 上默认 engine-onnx/），sherpa 的 onnxruntime.cmake 会优先读本地文件。
+ *
+ * ⚠ 变量名与版本未与 sherpa 真实 cmake 对齐：落地时读
+ * engine/third_party/sherpa-onnx/cmake/onnxruntime.cmake 里的实际变量与版本号，
+ * 再决定是否保留本块（也可能由 sherpa cmake 自行下载，此块仅作离线预置）。
+ */
+const ORT_VERSION = '1.17.0' // 与 sherpa 当前依赖的 onnxruntime 版本对齐（未验证）
+const ortBase = process.arch === 'arm64' ? 'osx-arm64' : 'osx-x86_64'
+const ortZip = `onnxruntime-${ortBase}-${ORT_VERSION}.tar.gz`
+const ortUrl = `https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${ortZip}`
+const ortTarget = path.join(root, ortZip)
+if (!fs.existsSync(ortTarget) || fs.statSync(ortTarget).size <= 1024) {
+  process.stdout.write(`下载 onnxruntime  ${ortZip} … `)
+  try {
+    execFileSync('curl', ['-sL', '--noproxy', '*', '--max-time', '600', '-o', ortTarget, ortUrl], {
+      stdio: 'ignore',
+    })
+    const size = fs.statSync(ortTarget).size
+    console.log(`${(size / 1048576).toFixed(1)} MB`)
+  } catch {
+    console.log('失败')
+    failed++
+  }
+}
+
 process.exit(failed === 0 ? 0 : 1)
