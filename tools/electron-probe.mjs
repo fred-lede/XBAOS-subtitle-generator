@@ -793,10 +793,15 @@ const scenarios = {
     await sleep(700)
 
     // 模拟原生崩溃（0xC0000005 在外部看起来就是进程没了）
+    // 进程名按平台区分：Windows 是 xbaos-engine.exe，macOS 是 xbaos-engine
     try {
-      execFileSync('taskkill', ['/F', '/IM', 'xbaos-engine.exe'], { stdio: 'ignore' })
+      if (process.platform === 'darwin') {
+        execFileSync('pkill', ['-f', 'xbaos-engine'], { stdio: 'ignore' })
+      } else {
+        execFileSync('taskkill', ['/F', '/IM', 'xbaos-engine.exe'], { stdio: 'ignore' })
+      }
     } catch {
-      /* 进程可能已经不在了 */
+      /* 进程可能已经不在了（pkill 没匹配到也是这个出口） */
     }
 
     const r = await cdp.evaluate(`(async () => {

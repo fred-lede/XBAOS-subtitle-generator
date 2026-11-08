@@ -58,7 +58,7 @@ const canStart = computed(() => pendingFiles.value.length > 0 && !project.recogn
 /** 依据当前后端与推理深度估算耗时。auto 档取中间值，不敢许空头承诺 */
 const estimate = computed(() => {
   const kind: 'gpu' | 'cpu' | 'unknown' =
-    settings.backend === 'cpu' ? 'cpu' : settings.backend === 'vulkan' ? 'gpu' : 'unknown'
+    settings.backend === 'cpu' ? 'cpu' : settings.backend === 'vulkan' || settings.backend === 'metal' ? 'gpu' : 'unknown'
   // 与 depthHint 同一条判据：不支持多遍解码的模型按单遍算
   const depth = model.caps.decode ? settings.reasoningDepth : 'standard'
   return formatEstimate(estimateSeconds(project.intakeDuration, depth, kind))

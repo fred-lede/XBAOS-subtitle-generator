@@ -73,7 +73,7 @@ export const SETTINGS_ENTRIES: readonly SettingsEntry[] = [
     section: 'sec-backend',
     anchor: 'field-backend',
     group: 'engine',
-    keywords: ['显卡', '核显', '加速', 'cpu', 'vulkan', 'gpu', '仅cpu', '性能'],
+    keywords: ['显卡', '核显', '加速', 'cpu', 'vulkan', 'metal', 'gpu', '仅cpu', '性能', '苹果显卡', 'apple gpu'],
   },
   {
     id: 'models-dir',

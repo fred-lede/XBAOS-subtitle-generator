@@ -1,8 +1,9 @@
 # ============================================================================
 #  XBAOS 字幕生成器 —— 识别引擎
 #
-#  产物：xbaos-engine.exe
-#     · /MT 静态链接 C 运行时，发布包不需要任何 vcruntime / msvcp DLL
+#  产物：
+#     · Windows：xbaos-engine.exe（/MT 静态链接 C 运行时，发布包不需要任何 vcruntime / msvcp DLL）
+#     · macOS  ：xbaos-engine（无后缀，AppleClang + 系统库）
 #     · 静态链接 whisper.cpp 与 ggml，单文件即可运行
 #     · 可选 Vulkan 后端（XBAOS_VULKAN=ON）
 #
