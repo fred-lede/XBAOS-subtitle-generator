@@ -70,18 +70,28 @@ const THEME_OPTIONS = [
   { value: 'dark', icon: 'moon', label: '深色' },
 ] as const
 
+/**
+ * 推理后端选项。第三个选项（GPU）的文案与取值按平台：
+ * Windows 是「强制 Vulkan」，macOS 是「强制 Metal」（引擎侧把 'metal' 意图映射为
+ * Metal 后端，见 electron/backend-intent.js）。
+ */
+const isMac = bridge?.platform === 'darwin'
 const BACKEND_OPTIONS = [
   {
     value: 'auto',
     label: '自动',
-    hint: '检测到支持 Vulkan 的显卡时启用加速；显卡后端异常时自动回退 CPU 重试',
+    hint: isMac
+      ? '检测到 Apple GPU（Metal）时启用加速；后端异常时自动回退 CPU 重试'
+      : '检测到支持 Vulkan 的显卡时启用加速；显卡后端异常时自动回退 CPU 重试',
   },
   {
     value: 'cpu',
     label: '仅 CPU',
     hint: '完全不加载显卡后端，兼容性最好，速度取决于处理器性能',
   },
-  { value: 'vulkan', label: '强制 Vulkan', hint: '需要显卡驱动支持，若不可用会导致识别失败' },
+  isMac
+    ? { value: 'metal', label: '强制 Metal', hint: '需要 Apple GPU，若不可用会导致识别失败' }
+    : { value: 'vulkan', label: '强制 Vulkan', hint: '需要显卡驱动支持，若不可用会导致识别失败' },
 ] as const
 
 /**

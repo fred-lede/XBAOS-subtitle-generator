@@ -189,15 +189,19 @@ export class EngineClient extends EventEmitter {
          * XBAOS_MODELS_DIR，表现为「明明指定了模型目录，引擎却说没有模型」。
          */
         const env = { ...process.env }
-        if (this.#disableVulkan) env.GGML_DISABLE_VULKAN = '1'
+        // GGML_DISABLE_VULKAN 只对 Windows 的 Vulkan 构建有意义；macOS 的 Metal
+        // 不受它控制（引擎侧读不到这个变量），按平台门控只是双保险。
+        if (this.#disableVulkan && process.platform === 'win32') env.GGML_DISABLE_VULKAN = '1'
 
-        // windowsHide 避免打包后弹黑框；shell 必须关掉，参数里有含空格的路径
-        proc = spawn(this.#exe, this.#spawnArgs, {
+        // shell 必须关掉，参数里有含空格的路径
+        const spawnOpts = {
           stdio: ['pipe', 'pipe', 'pipe'],
-          windowsHide: true,
           shell: false,
           env,
-        })
+        }
+        // windowsHide 避免打包后弹黑框；它只在 Windows 上存在，按平台传
+        if (process.platform === 'win32') spawnOpts.windowsHide = true
+        proc = spawn(this.#exe, this.#spawnArgs, spawnOpts)
       } catch (err) {
         reject(err)
         return

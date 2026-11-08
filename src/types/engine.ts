@@ -7,8 +7,8 @@
 
 import type { InferenceBackend, PunctuationOptions, SubtitleSegment } from './index'
 
-/** 引擎支持的推理后端清单，随编译配置变化 */
-export type EngineBackendName = 'cpu' | 'vulkan'
+/** 引擎支持的推理后端清单，随编译配置与平台变化（mac 上是 Metal） */
+export type EngineBackendName = 'cpu' | 'vulkan' | 'metal'
 
 // ------------------------------------------------------------------ 握手
 

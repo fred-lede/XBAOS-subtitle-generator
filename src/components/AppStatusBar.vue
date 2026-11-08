@@ -13,8 +13,11 @@ const ui = useUiStore()
 const logs = useLogStore()
 
 const backendLabel = computed(() => {
+  const isMac = window.xbaos?.platform === 'darwin'
   if (settings.backend === 'cpu') return 'CPU'
   if (settings.backend === 'vulkan') return 'Vulkan'
+  if (settings.backend === 'metal') return 'Metal'
+  if (isMac && settings.backend === 'auto') return '自动（Metal）'
   return '自动'
 })
 

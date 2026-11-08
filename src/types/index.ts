@@ -236,7 +236,7 @@ export type BatchMode =
   | 'separate'
 
 /** 推理后端 */
-export type InferenceBackend = 'auto' | 'cpu' | 'vulkan'
+export type InferenceBackend = 'auto' | 'cpu' | 'vulkan' | 'metal'
 
 /** 主题模式 */
 export type ThemeMode = 'auto' | 'light' | 'dark'

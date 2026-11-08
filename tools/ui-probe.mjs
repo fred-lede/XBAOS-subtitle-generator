@@ -14,12 +14,44 @@
  */
 
 import { spawn } from 'node:child_process'
-import { mkdirSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { setTimeout as sleep } from 'node:timers/promises'
 import path from 'node:path'
 import { capture, connect } from './lib/cdp.mjs'
 
-const CHROME = 'C:/Program Files/Google/Chrome/Application/chrome.exe'
+/**
+ * 浏览器可执行文件。
+ *
+ * 写死 `C:/Program Files/...` 在 macOS 上直接 ENOENT。按平台找默认路径，
+ * 与 tools/site-probe.mjs 的 findChrome 同一套规则：
+ * 环境变量 XBAOS_CHROME 优先，否则各平台的默认安装位置。
+ */
+function findChrome() {
+  if (process.env.XBAOS_CHROME && existsSync(process.env.XBAOS_CHROME)) return process.env.XBAOS_CHROME
+  const candidates =
+    process.platform === 'darwin'
+      ? [
+          '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+          '/Applications/Chromium.app/Contents/MacOS/Chromium',
+          '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+        ]
+      : process.platform === 'linux'
+        ? [
+            '/usr/bin/google-chrome',
+            '/usr/bin/google-chrome-stable',
+            '/usr/bin/chromium',
+            '/usr/bin/chromium-browser',
+          ]
+        : [
+            'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+            'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+            'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+            'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+          ]
+  return candidates.find((p) => existsSync(p)) || ''
+}
+
+const CHROME = findChrome()
 const PORT = 9333
 const BASE = `http://127.0.0.1:${process.env.XBAOS_DEV_PORT || 5173}`
 const OUT_DIR = path.resolve('.workbuddy/shots')
@@ -82,6 +114,9 @@ const waitFor = async (cdp, expr, timeoutMs = 60_000, stepMs = 300) => {
 /* ------------------------------------------------------------------ 启动浏览器 */
 
 async function launch() {
+  if (!CHROME) {
+    throw new Error('找不到 Chrome / Edge，可用环境变量 XBAOS_CHROME 指定浏览器路径')
+  }
   const args = [
     '--headless=new',
     '--disable-gpu',
