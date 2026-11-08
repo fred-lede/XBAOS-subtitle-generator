@@ -25,10 +25,10 @@ project(xbaos-engine
 #  工具链
 # ---------------------------------------------------------------------------
 
-if(NOT MSVC)
+if(NOT MSVC AND NOT APPLE)
     message(FATAL_ERROR
-        "本引擎只支持 MSVC 工具链。\n"
-        "原因是需要 /MT 静态链接 C 运行时，保证发布产物零外部运行时依赖。\n"
+        "本引擎支持 MSVC（Windows）与 AppleClang（macOS）工具链。\n"
+        "MSVC 需要 /MT 静态链接；AppleClang 由系统库静态链接，无需等价物。\n"
         "当前编译器：${CMAKE_CXX_COMPILER_ID}")
 endif()
 
@@ -40,16 +40,18 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "构建类型" FORCE)
 endif()
 
-# 源码含中文注释与中文字面量，必须显式按 UTF-8 解析，
-# 否则 MSVC 会按系统代码页（GBK）读，中文全乱。
-add_compile_options(/utf-8)
+if(MSVC)
+    # 源码含中文注释与中文字面量，必须显式按 UTF-8 解析，
+    # 否则 MSVC 会按系统代码页（GBK）读，中文全乱。
+    add_compile_options(/utf-8)
 
-# ---------------------------------------------------------------------------
-#  静态 C 运行时
-#  这一条决定了发布产物能否做到「一个 exe，零外部 DLL」
-# ---------------------------------------------------------------------------
-set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
-    CACHE STRING "MSVC 运行时库" FORCE)
+    # -----------------------------------------------------------------------
+    #  静态 C 运行时
+    #  这一条决定了发布产物能否做到「一个 exe，零外部 DLL」
+    # -----------------------------------------------------------------------
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+        CACHE STRING "MSVC 运行时库" FORCE)
+endif()
 
 # ---------------------------------------------------------------------------
 #  依赖路径
@@ -95,19 +97,23 @@ set(WHISPER_USE_SYSTEM_LLAMA       OFF CACHE BOOL "" FORCE)
 # 该分支会自动打开一些指令集，正是我们要避免的。
 set(GGML_NATIVE        OFF CACHE BOOL "" FORCE)
 
-set(GGML_SSE42         ON  CACHE BOOL "" FORCE)
-set(GGML_AVX           ON  CACHE BOOL "" FORCE)
-set(GGML_AVX2          ON  CACHE BOOL "" FORCE)
-set(GGML_BMI2          ON  CACHE BOOL "" FORCE)
+# x86 指令集开关只对非 Apple 平台有意义（目标机是 Intel Arrow Lake）；
+# Apple Silicon 是 ARM，ggml 在 ARM 上自行处理，这些开关一律不设置。
+if(NOT APPLE)
+    set(GGML_SSE42         ON  CACHE BOOL "" FORCE)
+    set(GGML_AVX           ON  CACHE BOOL "" FORCE)
+    set(GGML_AVX2          ON  CACHE BOOL "" FORCE)
+    set(GGML_BMI2          ON  CACHE BOOL "" FORCE)
 
-set(GGML_AVX512        OFF CACHE BOOL "" FORCE)
-set(GGML_AVX512_VBMI   OFF CACHE BOOL "" FORCE)
-set(GGML_AVX512_VNNI   OFF CACHE BOOL "" FORCE)
-set(GGML_AVX512_BF16   OFF CACHE BOOL "" FORCE)
+    set(GGML_AVX512        OFF CACHE BOOL "" FORCE)
+    set(GGML_AVX512_VBMI   OFF CACHE BOOL "" FORCE)
+    set(GGML_AVX512_VNNI   OFF CACHE BOOL "" FORCE)
+    set(GGML_AVX512_BF16   OFF CACHE BOOL "" FORCE)
 
-# 目标机支持 AVX-VNNI，理论上对量化推理有加速。
-# 先保守关闭，等 AVX2 路径实测稳定后再单独开一版对比。
-set(GGML_AVX_VNNI      OFF CACHE BOOL "" FORCE)
+    # 目标机支持 AVX-VNNI，理论上对量化推理有加速。
+    # 先保守关闭，等 AVX2 路径实测稳定后再单独开一版对比。
+    set(GGML_AVX_VNNI      OFF CACHE BOOL "" FORCE)
+endif()
 
 # ---------------------------------------------------------------------------
 #  其它后端一律关闭（减少编译面与体积）
@@ -117,7 +123,6 @@ set(GGML_ACCELERATE    OFF CACHE BOOL "" FORCE)
 set(GGML_BLAS          OFF CACHE BOOL "" FORCE)
 set(GGML_OPENMP        OFF CACHE BOOL "" FORCE)
 set(GGML_CUDA          OFF CACHE BOOL "" FORCE)
-set(GGML_METAL         OFF CACHE BOOL "" FORCE)
 set(GGML_SYCL          OFF CACHE BOOL "" FORCE)
 set(GGML_HIP           OFF CACHE BOOL "" FORCE)
 set(GGML_OPENCL        OFF CACHE BOOL "" FORCE)
@@ -145,6 +150,20 @@ if(XBAOS_VULKAN)
 endif()
 
 set(GGML_VULKAN ${XBAOS_VULKAN} CACHE BOOL "" FORCE)
+
+# ---------------------------------------------------------------------------
+#  Metal（macOS GPU 后端）
+#
+#  与 Windows 的 Vulkan 对称：编译进二进制后，运行时按 use_gpu 决定走 Metal
+#  还是 CPU。ggml 的 Metal 后端依赖 Xcode 自带，无需额外 SDK。
+# ---------------------------------------------------------------------------
+option(XBAOS_METAL "编译 Metal GPU 后端（macOS）" ${APPLE})
+
+if(XBAOS_METAL AND NOT APPLE)
+    message(FATAL_ERROR "Metal 后端只在 macOS（AppleClang）上可用。")
+endif()
+
+set(GGML_METAL ${XBAOS_METAL} CACHE BOOL "" FORCE)
 
 # ---------------------------------------------------------------------------
 #  第三方源码
@@ -203,6 +222,10 @@ if(XBAOS_VULKAN)
     target_compile_definitions(xbaos-engine PRIVATE XBAOS_HAS_VULKAN=1)
 endif()
 
+if(XBAOS_METAL)
+    target_compile_definitions(xbaos-engine PRIVATE XBAOS_HAS_METAL=1)
+endif()
+
 target_compile_definitions(xbaos-engine PRIVATE XBAOS_HAS_OPUS=${XBAOS_HAS_OPUS})
 
 # 控制台程序：发布时不需要带着控制台窗口，但保留它便于排查问题。
@@ -213,9 +236,14 @@ set_target_properties(xbaos-engine PROPERTIES
 message(STATUS "")
 message(STATUS "==================== xbaos-engine 配置 ====================")
 message(STATUS "  构建类型      : ${CMAKE_BUILD_TYPE}")
-message(STATUS "  MSVC 运行时   : ${CMAKE_MSVC_RUNTIME_LIBRARY}")
-message(STATUS "  CPU 指令集    : SSE4.2 AVX AVX2 BMI2（AVX-512 已显式关闭）")
+if(MSVC)
+    message(STATUS "  MSVC 运行时   : ${CMAKE_MSVC_RUNTIME_LIBRARY}")
+endif()
+if(NOT APPLE)
+    message(STATUS "  CPU 指令集    : SSE4.2 AVX AVX2 BMI2（AVX-512 已显式关闭）")
+endif()
 message(STATUS "  Vulkan 后端   : ${XBAOS_VULKAN}")
+message(STATUS "  Metal 后端    : ${XBAOS_METAL}")
 message(STATUS "  whisper.cpp   : ${WHISPER_CPP_DIR}")
 message(STATUS "==========================================================")
 message(STATUS "")

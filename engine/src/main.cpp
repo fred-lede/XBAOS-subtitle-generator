@@ -77,6 +77,11 @@
 #define XBAOS_HAS_VULKAN 0
 #endif
 
+// 由 CMakeLists 依据 XBAOS_METAL 注入（macOS 构建）
+#ifndef XBAOS_HAS_METAL
+#define XBAOS_HAS_METAL 0
+#endif
+
 namespace {
 
 /* ------------------------------------------------------------------ 输出 */
@@ -374,6 +379,9 @@ void cmdPing(const mj::Value &req, int64_t id) {
     // 运行期被禁用时不要报 vulkan —— 否则界面会显示一个根本用不了的能力
     if (std::getenv("GGML_DISABLE_VULKAN") == nullptr) w.value("vulkan");
 #endif
+#if XBAOS_HAS_METAL
+    w.value("metal");
+#endif
     w.endArray();
 
     w.key("modelLoaded").value(g_model.ctx != nullptr);
@@ -393,14 +401,12 @@ void cmdLoad(const mj::Value &req, int64_t id) {
     }
 
     const std::string requested = req.str("backend", "auto");
-
-    // 有没有 GPU 后端是编译期决定的。没编 Vulkan 时若仍把 use_gpu 设为 true，
-    // whisper 会静默忽略这个标志照常初始化成功，届时我们上报的后端就是错的，
-    // 用户会看到「在用 GPU」而实际跑在 CPU 上。所以这里先按编译宏纠正。
+    const bool hasGpuBackend = (XBAOS_HAS_VULKAN || XBAOS_HAS_METAL) != 0;
     bool wantGpu = (requested != "cpu");
-#if !XBAOS_HAS_VULKAN
-    if (wantGpu) {
-        const bool explicitGpu = (requested == "vulkan" || requested == "gpu");
+
+    if (!hasGpuBackend && wantGpu) {
+        // 没有任何 GPU 后端（纯 CPU 构建）：显式要 gpu/vulkan/metal 时纠正
+        const bool explicitGpu = (requested == "vulkan" || requested == "gpu" || requested == "metal");
         wantGpu = false;
         if (explicitGpu) {
             mj::Writer w;
@@ -409,20 +415,18 @@ void cmdLoad(const mj::Value &req, int64_t id) {
             w.key("type").value("fallback");
             w.key("from").value(requested);
             w.key("to").value("cpu");
-            w.key("reason").value("这个版本没有编译 Vulkan 后端，只能用 CPU");
+            w.key("reason").value("这个版本没有编译 GPU 后端，只能用 CPU");
             w.endObject();
             emit(w.take());
         }
     }
-#else
+
     /*
-     * 编译了 Vulkan 不等于这次真的能用。
-     *
-     * GGML_DISABLE_VULKAN 会让 ggml 的后端注册表整个跳过 Vulkan，而 whisper 对
-     * use_gpu=true 是**静默忽略**的 —— 它照样初始化成功，只是实际跑在 CPU 上。
-     * 不在这里纠正，我们就会把跑 CPU 的识别上报成 gpu，用户看到
-     * 「在用显卡」而其实没有。
+     * Metal 构建（mac）：Metal 后端在注册表构造时即初始化，没有 Vulkan 那样的
+     * GGML_DISABLE_* 运行期开关；whisper 的 use_gpu=true 在 Metal 可用时直接生效。
+     * Vulkan 构建（win）保持原 GGML_DISABLE_VULKAN 纠正逻辑。
      */
+#if XBAOS_HAS_VULKAN
     if (wantGpu && std::getenv("GGML_DISABLE_VULKAN") != nullptr) {
         const bool explicitGpu = (requested == "vulkan" || requested == "gpu");
         wantGpu = false;

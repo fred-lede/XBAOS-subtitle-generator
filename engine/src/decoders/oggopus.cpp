@@ -13,6 +13,13 @@
 
 #include "decoders.hpp"
 
+// 把 xdec 命名域里的类型引入文件作用域。
+// 下方 #if XBAOS_HAS_OPUS 分支里的 decodeOggOpus 定义与 xdec::decodeOggOpus
+// 声明处于不同命名域：clang 会报未定义名字/多余花括号错误，MSVC 宽容。
+// 这里做桥接，保证 Opus 启用与禁用两种编译组合都干净。
+using xdec::DecodedAudio;
+using xdec::decodeOggOpus;
+
 #if defined(XBAOS_HAS_OPUS) && XBAOS_HAS_OPUS
 #define OPUS_HAVE_OPUS 1
 // 源码树（GitHub archive）的头文件直接在 include/ 下，
@@ -134,9 +141,9 @@ private:
 
 inline uint16_t rdLE16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 
-#endif // OPUS_HAVE_OPUS
-
 } // namespace
+
+#endif // OPUS_HAVE_OPUS
 
 bool decodeOggOpus(const uint8_t *data, size_t size, DecodedAudio &out, std::string &err) {
 #ifdef OPUS_HAVE_OPUS
