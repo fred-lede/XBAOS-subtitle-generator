@@ -142,9 +142,48 @@ def build_ico(images):
     return header + entries + blobs
 
 
+def build_icns(images, out_dir, root):
+    """mac 的 .icns：优先走系统 iconutil；不可用时回退手写 icns 容器。"""
+    import shutil, subprocess
+    iconset = out_dir / "AppIcon.iconset"
+    if iconset.exists():
+        shutil.rmtree(iconset)
+    iconset.mkdir()
+    # iconutil 期望的文件名 → 尺寸映射
+    want = [
+        ("icon_16x16.png", 16), ("icon_16x16@2x.png", 32),
+        ("icon_32x32.png", 32), ("icon_32x32@2x.png", 64),
+        ("icon_128x128.png", 128), ("icon_128x128@2x.png", 256),
+        ("icon_256x256.png", 256), ("icon_256x256@2x.png", 512),
+        ("icon_512x512.png", 512), ("icon_512x512@2x.png", 1024),
+    ]
+    for name, s in want:
+        if s in images:
+            # iconset 条目必须是 PNG（iconutil 只接受 PNG）；这里统一重新编码，
+            # 避免复用给 ico 用的 BMP 条目字节
+            (iconset / name).write_bytes(encode_png(images[s], s))
+    icns_path = out_dir / "icon.icns"
+    if shutil.which("iconutil") is not None:
+        subprocess.run(["iconutil", "-c", "icns", str(iconset), "-o", str(icns_path)], check=True)
+        shutil.rmtree(iconset)
+        print("icon.icns (via iconutil)")
+    else:
+        # 无 iconutil（非 mac 机，例如 Windows 打包机）：手写一个最小 icns 容器，
+        # 只含 512 与 256 两个 icns 条目（icns 允许部分尺寸缺失，mac 会按可用
+        # 最高分辨率缩放）。打包机若是 mac（正常情况），走上面的 iconutil 分支。
+        def icns_entry(tag, png_bytes):
+            return tag + struct.pack(">I", 8 + len(png_bytes)) + png_bytes
+        container = b"icns"
+        for tag, s in ((b"ic07", 128), (b"ic11", 512)):
+            if s in images:
+                container += icns_entry(tag, encode_png(images[s], s))
+        icns_path.write_bytes(container)
+        print("icon.icns (hand-rolled container: 128/512)")
+
+
 def main():
     OUT.mkdir(exist_ok=True)
-    sizes = sorted(set(ICO_SIZES + [512]))
+    sizes = sorted(set(ICO_SIZES + [512, 1024]))
     images = {}
     for s in sizes:
         images[s] = rasterize(s)
@@ -152,6 +191,7 @@ def main():
         print(f"icon-{s}.png")
     (OUT / "icon.ico").write_bytes(build_ico(images))
     print("icon.ico")
+    build_icns(images, OUT, ROOT)
 
 
 if __name__ == "__main__":

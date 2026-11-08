@@ -29,16 +29,8 @@ files:
 asar: true
 
 extraResources:
-  # 识别引擎。两套并列，按模型架构选：
-  #   xbaos-engine.exe      whisper.cpp（ggml / Vulkan）—— Vulkan 版同时含 CPU 后端，
-  #                         机器没显卡或用户选了 cpu 时会自动走 CPU，所以只发这一个
-  #   xbaos-engine-asr.exe  sherpa-onnx（onnxruntime 静态链接）
-  # 两者都是 /MT 静态链接，零外部 DLL 依赖。
-  - from: engine/build/vulkan/bin/xbaos-engine.exe
-    to: engine/xbaos-engine.exe
-  - from: engine-onnx/build/bin/xbaos-engine-asr.exe
-    to: engine/xbaos-engine-asr.exe
-
+  # 平台无关的资源才放这里。识别引擎可执行文件因命名/路径按平台分叉
+  #（win: 带 .exe；mac: 无后缀），写在各自的 win: / mac: 段的 extraResources 里。
   # 说话人分离的两个小模型（合计 33MB）**随包分发**。
   #
   # 它们与识别模型是两回事：识别模型动辄几百 MB、按需下载；这两个只负责
@@ -70,6 +62,16 @@ win:
   target:
     - target: nsis
       arch: [x64]
+  # 识别引擎（Windows 侧）。两套并列，按模型架构选：
+  #   xbaos-engine.exe      whisper.cpp（ggml / Vulkan）—— Vulkan 版同时含 CPU 后端，
+  #                         机器没显卡或用户选了 cpu 时会自动走 CPU，所以只发这一个
+  #   xbaos-engine-asr.exe  sherpa-onnx（onnxruntime 静态链接）
+  # 两者都是 /MT 静态链接，零外部 DLL 依赖。
+  extraResources:
+    - from: engine/build/vulkan/bin/xbaos-engine.exe
+      to: engine/xbaos-engine.exe
+    - from: engine-onnx/build/bin/xbaos-engine-asr.exe
+      to: engine/xbaos-engine-asr.exe
   # 原创图标（tools/make-icons.py 生成，纯几何方块组合）
   icon: build/icon.ico
   # 明确声明不请求管理员权限（应用本身不需要，装到用户目录即可）
@@ -91,13 +93,27 @@ win:
 # 留下 `Software\Classes\.xbsgp` 这个键（默认值指着已删掉的 ProgID）。
 # 补的那一刀在 build/installer.nsh（`customUnInstall`），builder 会自动把它
 # 作为 include 装进安装脚本，不需要在这里声明。
-fileAssociations:
-  - ext: xbsgp
-    # ProgID。用点分 ASCII，不用中文，避免某些工具按 ANSI 读到乱码
-    name: XBAOS.SubtitleProject
-    description: 小包听幕项目
-    icon: build/icon.ico
-    role: Editor
+#
+# macOS 打包：未签名 dmg（dual-arch x64 + arm64），引擎 extraResources 走无后缀 mac 产物。
+mac:
+  category: public.app-category.productivity
+  target:
+    - target: dmg
+      arch: [x64, arm64]
+  # tools/make-icons.py 生成（mac 机走 iconutil，非 mac 机回退手写 icns 容器）
+  icon: build/icon.icns
+  # 识别引擎（mac 侧，无后缀）。GGML 引擎是 Metal+CPU 版；
+  # ONNX 引擎需要 sherpa-onnx 依赖链先落地（Task 2）。
+  extraResources:
+    - from: engine/build/metal/bin/xbaos-engine
+      to: engine/xbaos-engine
+    - from: engine-onnx/build/bin/xbaos-engine-asr
+      to: engine/xbaos-engine-asr
+  # 未签名：关闭 signing 与公证。首次打开需「右键 → 打开」绕过 Gatekeeper
+  identity: null
+  notarize: false
+  # app 的 bundle 名与 productName 一致
+  artifactName: ${productName}-${version}-${arch}.${ext}
 
 nsis:
   oneClick: false

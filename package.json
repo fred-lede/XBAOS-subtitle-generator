@@ -24,7 +24,9 @@
     "engine": "bash engine/build.sh",
     "engine:onnx": "bash engine-onnx/build.sh",
     "dist:dir": "npm run build:ui && electron-builder --win --dir",
-    "dist": "npm run build:ui && electron-builder --win"
+    "dist": "npm run build:ui && electron-builder --win",
+    "dist:mac": "npm run build:ui && electron-builder --mac",
+    "dist:mac:dir": "npm run build:ui && electron-builder --mac --dir"
   },
   "dependencies": {
     "pinia": "^4.0.3",
