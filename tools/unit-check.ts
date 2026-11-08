@@ -6155,5 +6155,35 @@ const OPT: PunctuationOptions = { zh: 'strip-split', en: 'keep' }
   )
 }
 
+/*
+ * Fix round 1：包一层 applyBackendIntent（electron/main.js）的 win32 副作用语义。
+ * 副作用规则（setDisableVulkan / writeVulkanDisabled 调用时机）与 2334a65 的原
+ * win32 代码逐分支等价，由静态审查（原代码 diff）钉住；这里在纯函数层面钉住
+ * 「vulkan/gpu 只在 !envForced 时才允许清持久禁用」的决策规则。
+ */
+{
+  check(
+    '决策层：envForced 的 vulkan 意图返回 cpu 且禁 GPU 标志为 false（主进程据此不清持久禁用）',
+    (() => {
+      const r = backendIntentToEngineBackend({
+        backend: 'vulkan', arch: 'whisper', isWindows: true, envForced: true, gpuDisabled: true,
+      })
+      return r.backend === 'cpu' && r.disableGpu === false
+    })(),
+  )
+  check(
+    '决策层：gpu 意图 + envForced 时 GPU 禁用标志为 false（不清除）',
+    backendIntentToEngineBackend({
+      backend: 'gpu', arch: 'whisper', isWindows: true, envForced: true, gpuDisabled: true,
+    }).disableGpu === false,
+  )
+  check(
+    '决策层：auto 意图的 disableGpu 为 false（主进程据此尊重上次降级，不清持久禁用）',
+    backendIntentToEngineBackend({
+      backend: 'auto', arch: 'whisper', isWindows: true, gpuDisabled: true,
+    }).disableGpu === false,
+  )
+}
+
 console.log(`\n通过 ${pass}，失败 ${fail}`)
 process.exit(fail > 0 ? 1 : 0)

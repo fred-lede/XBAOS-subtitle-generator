@@ -627,10 +627,26 @@ async function applyBackendIntent(client, backend, arch = ARCH_WHISPER) {
     gpuDisabled: client.disableVulkan,
     envForced: envDisablesVulkan(),
   })
-  if (result.disableGpu && !client.disableVulkan) await client.setDisableVulkan(true)
-  if (!result.disableGpu && client.disableVulkan) {
-    await client.setDisableVulkan(false)
-    writeVulkanDisabled(false)
+  /*
+   * 副作用规则必须与原 win32 代码（git show 2334a65）逐分支复刻：
+   * 原实现里 sherpa arch 与 envForced 的 vulkan/gpu 都是提前 return、零副作用；
+   * whisper 'auto' 的注释写明「尊重上次降级的结果，不主动再撞一次」—— 即
+   * 从不主动清除已持久化的禁用。纯函数只表达决策，副作用规则只写在这里
+   * （由静态审查对照原代码钉住，非单测覆盖）。
+   */
+  if (arch === ARCH_WHISPER) {
+    if (result.disableGpu && !client.disableVulkan) {
+      // original: whisper 'cpu' intent → setDisableVulkan(true)
+      await client.setDisableVulkan(true)
+    } else if ((backend === 'vulkan' || backend === 'gpu') && !envDisablesVulkan() && client.disableVulkan) {
+      // original: only an explicit non-forced vulkan/gpu intent clears the persisted disable
+      await client.setDisableVulkan(false)
+      writeVulkanDisabled(false)
+    }
+    // NOTE: deliberately NO "else clear" branch:
+    //  - sherpa arch never reconciles (original early-returned)
+    //  - auto intent never clears (original "尊重上次降级")
+    //  - envForced vulkan/gpu never clears (original early-returned)
   }
   return result.backend
 }
