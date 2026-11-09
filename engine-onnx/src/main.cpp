@@ -67,6 +67,7 @@ using namespace xaudio;
 #include <mutex>
 #include <string>
 #include <vector>
+#include <sys/stat.h>
 
 #ifdef _WIN32
 #include <fcntl.h>
@@ -230,6 +231,19 @@ std::string baseName(const std::string &path) {
     return pos == std::string::npos ? path : path.substr(pos + 1);
 }
 
+/**
+ * 路径是文件（不含目录）才返回 true。
+ *
+ * 为什么必须显式 stat：fopen 对目录在 POSIX 上**也能打开成功**（返回非 NULL），
+ * 所以「能不能 fopen」不能用来区分文件与目录 —— 目录型模型（sensevoice-small/）
+ * 会被误判成文件，dir 被推成它的父目录，tokens.txt 自然找不到（Windows 上
+ * fopen 目录会失败，所以这个 bug 只在 macOS/Linux 上暴露）。
+ */
+bool isRegularFile(const char *path) {
+    struct stat st;
+    return ::stat(path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFREG;
+}
+
 /** 传进来的是目录还是单个 onnx，两种都要能处理 */
 bool resolveModelFiles(const std::string &given, std::string &onnx, std::string &tokens,
                        std::string &err) {
@@ -240,8 +254,7 @@ bool resolveModelFiles(const std::string &given, std::string &onnx, std::string 
 
     std::string dir = given;
     // 传的是文件：优先当成 onnx，同时把目录推出来找 tokens.txt
-    if (FILE *f = std::fopen(given.c_str(), "rb")) {
-        std::fclose(f);
+    if (isRegularFile(given.c_str())) {
         dir = parentDir(given);
         onnx = given;
     } else {
