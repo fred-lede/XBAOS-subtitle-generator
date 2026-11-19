@@ -204,6 +204,11 @@ export interface TranscribeOptions {
   /** 音频文件绝对路径 */
   audio: string
   model?: string
+  /**
+   * 手动指定的识别架构。缺省 / `auto` 时由主进程按模型内容判定 ——
+   * 与设置里的「识别架构」是同一个值，只服务自己放置的未知模型。
+   */
+  arch?: ArchChoice
   backend?: InferenceBackend
   /** 'auto' 或 ISO 639-1 语言码 */
   language?: string
@@ -295,6 +300,21 @@ export interface EngineLocation {
 export type ModelKind = 'file' | 'dir'
 
 /**
+ * 引擎架构标识。取值与主进程 `model-catalog.js` 的两个常量一致：
+ * 字符串会存进设置、写进日志，改一处就要连迁移一起想。
+ */
+export type ArchId = 'whisper' | 'sherpa'
+
+/**
+ * 用户可选的识别架构。
+ *
+ * `auto` 表示由主进程读取模型内容判定。手动值只给「自己放置的模型」用：
+ * 自动判定认不出的权重（例如非 SenseVoice 的 ONNX 目录）需要用户自己指定
+ * 该交给哪套引擎，否则那个模型在软件里永远用不上。
+ */
+export type ArchChoice = 'auto' | ArchId
+
+/**
  * 架构能力开关。界面按它决定控件可用与否 —— 不要在组件里各写一套判断，
  * 换一种模型类型就要改三四个地方是上一版的真实教训。
  */
@@ -327,6 +347,11 @@ export interface ActiveModelInfo {
   /** 展示用，如「sherpa-onnx（ONNX Runtime）」 */
   archLabel: string
   caps: ArchCaps
+  /**
+   * 架构是否来自用户手动指定（设置里没选「自动」）。
+   * 手动值与模型内容不一致时界面要说明「按指定架构运行」。
+   */
+  archForced: boolean
 }
 
 /** `models.catalog` 的条目：可下载模型及其公示信息 */
@@ -540,6 +565,19 @@ export interface XbaosBridge {
       | { ok: true; path: string | null; cached: boolean }
       | { ok: false; message: string }
     >
+    /**
+     * 解码缓存的占用情况。
+     *
+     * 这份缓存是**源采样率**的单声道 PCM（48kHz 一小时 345MB），所以它能长到
+     * 用户看得见的程度。`limit` 是主进程里那道硬上限（512MB），
+     * `files` 按时间倒序，只带删文件与显示所需的最小信息。
+     */
+    cacheStats: () => Promise<MediaCacheStats>
+    /** 不给名字 = 全部清除；给数组 = 只删这几个。返回删掉几份与最新统计 */
+    clearCache: (names?: string[]) => Promise<{
+      removed: number
+      stats: MediaCacheStats
+    }>
   }
 
   fs: {
@@ -590,14 +628,22 @@ export interface XbaosBridge {
   /**
    * 自动草稿（防丢）。
    *
-   * 未保存的工程定期写到 `userData/autosave/draft.xbsgp`，下次启动发现就恢复。
-   * 存的是标准 `.xbsgp` 文本，恢复时走正常打开流程，不另立格式。
+   * 未保存的工程定期写到 `userData/autosave/<项目 id>.xbsgp`，下次启动发现就
+   * 恢复。存的是标准 `.xbsgp` 文本，恢复时走正常打开流程，不另立格式。
+   *
+   * **一个项目一份**：多个项目同时开着、各自有改动时互不影响，也免得每 15 秒
+   * 把所有项目全量重写一遍。
    */
   autosave: {
-    /** 有没有可恢复的草稿。path 给的是主进程算出的位置，渲染层不拼路径 */
-    peek: () => Promise<{ exists: boolean; path: string; savedAt: number }>
-    write: (text: string) => Promise<boolean>
-    clear: () => Promise<boolean>
+    /** 有哪些草稿可以恢复。`path` 由主进程算，渲染层不拼路径 */
+    list: () => Promise<AutosaveDraft[]>
+    write: (
+      id: string,
+      text: string,
+      meta: { name: string; savedPath: string },
+    ) => Promise<boolean>
+    /** 传 id 删这一份（保存成功、项目被关掉）；不传清空全部 */
+    clear: (id?: string) => Promise<boolean>
   }
 
   /**
@@ -730,7 +776,7 @@ export interface XbaosBridge {
      * 当前生效模型与架构。传设置里存的标识，主进程负责判定架构并记住 ——
      * 界面不要自己按文件名猜架构。没有可用模型时 entry 为 null。
      */
-    active: (id: string) => Promise<ActiveModelInfo>
+    active: (id: string, arch?: ArchChoice) => Promise<ActiveModelInfo>
     /** 重新扫一遍模型目录（用户在资源管理器里动了文件之后用） */
     refresh: () => Promise<ModelFileInfo[]>
     /**
@@ -763,7 +809,7 @@ export interface XbaosBridge {
 
   engine: {
     status: () => Promise<EngineStatusResult>
-    load: (opts?: { model?: string; backend?: InferenceBackend }) => Promise<
+    load: (opts?: { model?: string; backend?: InferenceBackend; arch?: ArchChoice }) => Promise<
       EngineLoaded & { ok: boolean; backend: EngineActiveBackend }
     >
     unload: () => Promise<{ ok: boolean }>
@@ -912,4 +958,59 @@ export interface UpdateCheckResult {
   /** HTTP 状态码。网络层失败（连不上、超时）时为 null */
   code?: number | null
   message?: string
+}
+
+/**
+ * 解码缓存的统计（主进程 `media-cache.js` 的 `stats()`）。
+ *
+ * 为什么需要它：这份缓存是**源采样率**的单声道 PCM，48kHz 一小时 345MB，
+ * 光靠 3 天过期管不住体积 —— 所以有 `limit` 那道硬上限，也要让用户看得见。
+ */
+export interface MediaCacheStats {
+  /** 当前总占用（字节） */
+  bytes: number
+  /** 缓存文件数 */
+  count: number
+  /** 总容量上限（字节），超了主进程按最久未用淘汰 */
+  limit: number
+  /** 缓存目录的绝对路径，设置页显示与「打开文件夹」用 */
+  dir: string
+  /** 文件列表，按时间**倒序**（最近转的在前） */
+  files: MediaCacheFile[]
+}
+
+export interface MediaCacheFile {
+  /** 文件名（sha1 前 24 位 + .wav） */
+  name: string
+  bytes: number
+  /** 修改时间戳（毫秒）。这就是「最后一次使用」的判据 */
+  mtime: number
+  /** 源文件名。只在本进程内转过才有值，重启后为空 */
+  source: string
+  /** 本次运行中用过 —— 自动清理会跳过它 */
+  inUse: boolean
+}
+
+/**
+ * 一份可以恢复的自动草稿。
+ *
+ * `id` 同时是文件名主干：恢复时沿用它，之后再写草稿就落在同一份文件上，
+ * 不会因为重启而留下孤儿文件。
+ */
+export interface AutosaveDraft {
+  id: string
+  /** 草稿文件本身的位置（`.xbsgp` 文本，可直接喂给打开项目的流程） */
+  path: string
+  /** 项目名，只用于提示。索引丢了就是空串 */
+  name: string
+  /**
+   * 这份草稿对应的**用户文件**（用户按过保存的那个 `.xbsgp`）。
+   *
+   * 恢复时把路径还原成它、状态标成未保存 —— 与记事本一致：内容回来了，
+   * 「还没存」这件事没变，按一次保存就覆盖回原文件。
+   */
+  savedPath: string
+  /** 最后一次写盘的时间（毫秒） */
+  savedAt: number
+  bytes: number
 }

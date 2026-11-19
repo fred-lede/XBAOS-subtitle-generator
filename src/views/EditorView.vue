@@ -170,10 +170,90 @@ function onKeydown(event: KeyboardEvent): void {
     if ((activeFile.value?.durationSec ?? 0) > 0) editor.togglePlay()
     return
   }
+
+  // ←/→ 微调游标，每下 0.1 秒，按住持续移动
+  if (key === 'ArrowLeft' || key === 'ArrowRight') {
+    if (mod || event.altKey) return
+    // 输入框里的方向键属于输入本身（移动文本光标、在候选里挑字）
+    if (isTypingTarget(event.target)) return
+    // 弹窗开着时游标看不见，挪它只会让人以为是界面在乱动
+    if (ui.dialog) return
+    event.preventDefault()
+    // 系统的重复键不认：首延迟与重复率由系统设置决定，这里自己排节奏
+    if (event.repeat) return
+    const direction = key === 'ArrowLeft' ? -1 : 1
+    nudgePlayhead(direction, true)
+    startNudgeHold(direction)
+    return
+  }
 }
 
-onMounted(() => window.addEventListener('keydown', onKeydown))
-onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
+/*
+ * 微调的步长与长按节奏。
+ *
+ * 步长固定 0.1 秒，不乘播放速度：用户说的是「每下 0.1 秒」，倍速下也应当是
+ * 0.1 秒 —— 倍速改变的是听的速度，不是时间轴上的刻度。
+ */
+const NUDGE_SEC = 0.1
+const NUDGE_HOLD_DELAY_MS = 300
+const NUDGE_HOLD_STEP_MS = 55
+
+let nudgeHoldTimer = 0
+let holdingNudge: -1 | 1 | null = null
+
+/**
+ * 挪一次游标。
+ *
+ * `pause` 为真时先停下再挪。播放中游标由音频驱动，逐帧写回会把任何外部位置
+ * 覆盖掉 —— 不先停，0.1 秒的微调在下一帧就被抹平，按下去等于没反应。微调本身
+ * 也是「找切点」的动作，边听边挪本来就没有意义。
+ */
+function nudgePlayhead(direction: -1 | 1, pause: boolean): void {
+  const file = activeFile.value
+  if (!file) return
+  const duration = file.durationSec ?? 0
+  let next = editor.playheadSec + direction * NUDGE_SEC
+  if (duration > 0) next = Math.min(next, duration)
+  editor.seekTo(next, { pause })
+}
+
+function stopNudgeHold(): void {
+  holdingNudge = null
+  if (nudgeHoldTimer) window.clearTimeout(nudgeHoldTimer)
+  nudgeHoldTimer = 0
+}
+
+function startNudgeHold(direction: -1 | 1): void {
+  stopNudgeHold()
+  holdingNudge = direction
+  const step = (): void => {
+    if (holdingNudge === null) return
+    nudgePlayhead(holdingNudge, false)
+    nudgeHoldTimer = window.setTimeout(step, NUDGE_HOLD_STEP_MS)
+  }
+  nudgeHoldTimer = window.setTimeout(step, NUDGE_HOLD_DELAY_MS)
+}
+
+function onKeyup(event: KeyboardEvent): void {
+  if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') stopNudgeHold()
+}
+
+/** 松手事件可能丢（切窗口、切输入法），失焦时一律收手，否则游标会一直走 */
+function onWindowBlur(): void {
+  stopNudgeHold()
+}
+
+onMounted(() => {
+  window.addEventListener('keydown', onKeydown)
+  window.addEventListener('keyup', onKeyup)
+  window.addEventListener('blur', onWindowBlur)
+})
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onKeydown)
+  window.removeEventListener('keyup', onKeyup)
+  window.removeEventListener('blur', onWindowBlur)
+  stopNudgeHold()
+})
 
 /**
  * 按时间轴播放头分割字幕（Ctrl+B 的另一半语义，仅在未编辑文本时生效）。
@@ -452,6 +532,11 @@ function saveProjectFile(): void {
   else ui.openDialog('save-project')
 }
 
+/** 空态里的「打开项目」：走的是和侧栏那个入口完全一样的一条路 */
+function openProjectFile(): void {
+  void project.openProject()
+}
+
 const saveMenu = ref<{ x: number; y: number } | null>(null)
 
 function openSaveMenu(event: MouseEvent): void {
@@ -575,13 +660,34 @@ function openExport(): void {
     -->
     <div v-if="!project.hasFiles" class="editor__empty">
       <Icon name="list" :size="22" class="editor__empty-icon" />
-      <p class="editor__empty-title">还没有可编辑的字幕</p>
-      <p class="editor__empty-text">
-        导入音频并完成识别，或者直接打开一个 .srt / .vtt / .ass 字幕文件。
-      </p>
-      <button class="btn btn--primary" type="button" @click="ui.navigate('home')">
-        去导入
-      </button>
+      <!--
+        识别刚起步时这个项目还是空的（第一份结果要跑完才落地）。不说一句，
+        用户点进工作台看到的就是「还没有可编辑的字幕」，会以为识别没开始。
+      -->
+      <template v-if="project.recognizing">
+        <p class="editor__empty-title">正在识别</p>
+        <p class="editor__empty-text">
+          这个项目还在等第一份结果，完成后会出现在这里。左侧其他项目现在就能打开。
+        </p>
+        <button class="btn" type="button" @click="ui.navigate('home')">查看进度</button>
+      </template>
+      <template v-else>
+        <p class="editor__empty-title">还没有可编辑的字幕</p>
+        <p class="editor__empty-text">
+          导入音频并完成识别，或者打开一个已有的项目或字幕文件。
+        </p>
+        <!--
+          两条路并列：新导入是常态，但这里已经是「工作台」了 —— 手上没有
+          可编辑内容的人，有一半是想接着上次那份 `.xbsgp` 干活。
+          只给「去导入」会让他退回导入页，再从那里找「打开项目」。
+        -->
+        <div class="editor__empty-actions">
+          <button class="btn btn--primary" type="button" @click="ui.navigate('home')">
+            去导入
+          </button>
+          <button class="btn" type="button" @click="openProjectFile">打开项目</button>
+        </div>
+      </template>
     </div>
 
     <div v-else class="editor__body">
@@ -846,6 +952,13 @@ function openExport(): void {
 }
 
 .editor__empty > .btn {
+  margin-top: var(--space-2);
+}
+
+.editor__empty-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
   margin-top: var(--space-2);
 }
 

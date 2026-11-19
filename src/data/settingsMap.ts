@@ -83,12 +83,28 @@ export const SETTINGS_ENTRIES: readonly SettingsEntry[] = [
     keywords: ['模型目录', '模型路径', '存放位置', '下载目录', '文件夹', 'ggml'],
   },
   {
+    id: 'arch',
+    label: '识别架构',
+    section: 'sec-recognize',
+    anchor: 'field-arch',
+    group: 'engine',
+    keywords: ['架构', '引擎', 'whisper', 'ggml', 'sherpa', 'onnx', 'sensevoice', '自动判定'],
+    note: '仅在模型无法自动判定时指定',
+  },
+  {
     id: 'recognize',
     label: '识别设置入口',
     section: 'sec-recognize',
     group: 'engine',
     keywords: ['语言', '推理深度', '领域词库', '热词提示', '音质前处理', '导入页'],
     note: '位于导入页',
+  },
+  {
+    id: 'cache',
+    label: '解码缓存',
+    section: 'sec-cache',
+    group: 'engine',
+    keywords: ['缓存', '占用', '清理', '磁盘空间', '硬盘', 'media-cache', '试听', '波形'],
   },
 
   // ---- 字幕处理

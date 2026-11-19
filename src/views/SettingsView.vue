@@ -24,10 +24,74 @@ import {
 } from '@/data/settingsMap'
 import Icon from '@/components/Icon.vue'
 import WordbookDialog from '@/components/dialogs/WordbookDialog.vue'
+import { useMediaCacheStore } from '@/stores/mediaCache'
+import { formatBytes } from '@/utils/format'
 
 const settings = useSettingsStore()
 const model = useModelStore()
 const ui = useUiStore()
+const mediaCache = useMediaCacheStore()
+
+/* ------------------------------------------------------- 识别架构 */
+
+/**
+ * 架构只给「软件没适配过的模型」用。
+ *
+ * 软件内置的模型都能自动判定，选自动即可；用户自己放进模型目录的权重
+ * 认不出来时，才需要在这里指定该交给哪套引擎。
+ */
+const ARCH_OPTIONS = [
+  { value: 'auto', label: '自动（按模型判定）' },
+  { value: 'whisper', label: 'whisper.cpp（GGML）' },
+  { value: 'sherpa', label: 'sherpa-onnx（ONNX Runtime）' },
+]
+
+const archHint = computed(() => {
+  if (model.archForced) {
+    return `当前按${model.archLabel}运行，与模型内容的判定结果不同。模型与架构不匹配时识别会失败。`
+  }
+  if (model.archLabel) return `当前模型使用${model.archLabel}。`
+  return '使用内置模型时保持自动。自行放置的模型无法判定架构时，再在此指定。'
+})
+
+/* ------------------------------------------------------- 解码缓存 */
+
+/** 进入设置页就取一次：用户从底栏点进来时，数字必须是当下的 */
+onMounted(() => {
+  void mediaCache.refresh()
+})
+
+onActivated(() => {
+  void mediaCache.refresh()
+})
+
+/** 打开缓存目录。目录还没建出来时系统会报错，这里把原因照实转给用户 */
+async function openCacheDir(): Promise<void> {
+  if (!bridge?.fs || !mediaCache.stats.dir) return
+  const message = await bridge.fs.openPath(mediaCache.stats.dir)
+  if (message) ui.notify('error', '打不开缓存文件夹', message)
+}
+
+async function removeCacheFile(name: string): Promise<void> {
+  const removed = await mediaCache.clear([name])
+  if (removed === 0) ui.notify('warning', '没有删掉', '这份缓存可能正被占用，稍后再试')
+}
+
+async function clearAllCache(): Promise<void> {
+  if (!mediaCache.hasCache) return
+  if (!window.confirm('清除全部解码缓存？\n\n不影响已识别的字幕与项目文件。下次播放这些音频时会重新解码。')) {
+    return
+  }
+  const removed = await mediaCache.clear()
+  ui.notify('info', '已清除解码缓存', `共删掉 ${removed} 份`)
+}
+
+/** 缓存文件的时间：只到分钟。这是「最后用过」的时间，不是创建时间 */
+function cacheWhen(ms: number): string {
+  const d = new Date(ms)
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
 
 /** 词表里能解析出多少条可用规则。给个即时反馈，免得手滑写了不生效还不知道 */
 const dictRuleCount = computed(() => parseReplaceDict(settings.dictReplacements).length)
@@ -164,13 +228,20 @@ function selectGroup(id: string): void {
   })
 }
 
-/** 高亮刚跳到的目标，1.6 秒后自己淡出 */
+/**
+ * 高亮刚跳到的目标。
+ *
+ * 闪两次再淡出，而不是亮一下就没了：一次 0.15 秒的亮起很容易被看成「页面重绘了一下」，
+ * 用户还没把视线挪过去就已经结束。两次淡入淡出给了足够的时间定位，最后那段淡出
+ * 负责收尾 —— 硬切会显得像是界面抖了一下。
+ */
+const FLASH_MS = 2600
 let flashTimer = 0
 function flash(el: HTMLElement): void {
   window.clearTimeout(flashTimer)
   for (const node of document.querySelectorAll('.is-flash')) node.classList.remove('is-flash')
   el.classList.add('is-flash')
-  flashTimer = window.setTimeout(() => el.classList.remove('is-flash'), 1600)
+  flashTimer = window.setTimeout(() => el.classList.remove('is-flash'), FLASH_MS)
 }
 
 /**
@@ -229,6 +300,7 @@ const SHORTCUTS: { keys: string[]; label: string }[] = [
   { keys: ['Esc'], label: '取消编辑' },
   { keys: ['↑', '↓'], label: '上一条 / 下一条' },
   { keys: ['Space'], label: '播放 / 暂停' },
+  { keys: ['←', '→'], label: '游标左移 / 右移 0.1 秒。按住持续移动，播放中会先暂停' },
   { keys: ['L'], label: '循环当前句' },
   { keys: ['Insert'], label: '在当前条之后插入一条' },
   { keys: ['Delete'], label: '删除选中的字幕' },
@@ -271,17 +343,45 @@ onMounted(() => {
 })
 
 /**
+ * 消费待处理的跳转锚点。
+ *
+ * `consuming` 是防重入用的：视图切换的那一刻 `onActivated` 与下面的 watch
+ * 会同时到达，没有它就会对同一个锚点滚两次（画面先跳一下再跳回来）。
+ */
+let consuming: string | null = null
+
+function consumeAnchor(): void {
+  const anchor = ui.settingsAnchor
+  if (!anchor || consuming === anchor) return
+  ui.settingsAnchor = null
+  consuming = anchor
+  void nextTick(async () => {
+    await jumpToDomId(anchor)
+    consuming = null
+  })
+}
+
+/**
  * 从模型管理页点「模型存储位置」跳进来时，直接切到对应分组并滚到章节。
  * 设置页被 KeepAlive 缓存着，切回来**不会**重新挂载 —— 所以跳转只能靠
  * `ui.settingsAnchor` 这个状态触发，不能只写在 onMounted 里。
  */
 onActivated(() => {
   void refreshModelsDir()
-  const anchor = ui.settingsAnchor
-  if (!anchor) return
-  ui.settingsAnchor = null
-  void nextTick(() => jumpToDomId(anchor))
+  consumeAnchor()
 })
+
+/*
+ * 已经在设置页时也要认这个锚点。
+ *
+ * 底栏那个「缓存 421 MB」在设置页也可见，点它时视图没有变化 —— `onActivated`
+ * 不会触发，光靠上面那段就会出现「点了没反应」。watch 管这件事，
+ * `consumeAnchor` 里用 `consuming` 防重入：视图切换时这两条路径会同时到达。
+ */
+watch(
+  () => ui.settingsAnchor,
+  () => consumeAnchor(),
+)
 
 /**
  * 更改模型存储位置。
@@ -540,17 +640,111 @@ function reset(): void {
               </div>
             </section>
 
-            <!-- 识别相关的设置已整体移到「导入」页，方便每次导入前顺手调整 -->
+            <!-- 解码缓存：试听与波形用的那份中间文件，会让目录自己长大 -->
+            <section id="sec-cache" class="block">
+              <div class="block__head">
+                <Icon name="database" :size="14" />
+                <span class="block__title">解码缓存</span>
+              </div>
+              <div class="block__body">
+                <p class="hint">
+                  AAC 等需要通过 Windows 系统解码器解码的音频，将会在识别完成后产生临时缓存。缓存会被用于试听和波形图渲染等。清除缓存不影响软件的正常功能。
+                </p>
+
+                <div class="cache__meter" :class="{ 'is-over': mediaCache.ratio >= 1 }">
+                  <span
+                    class="cache__fill"
+                    :style="{ width: `${Math.round(mediaCache.ratio * 100)}%` }"
+                  />
+                </div>
+                <p class="cache__stat">
+                  <span>
+                    已用 <strong>{{ formatBytes(mediaCache.stats.bytes) }}</strong>
+                    <template v-if="mediaCache.stats.limit > 0">
+                      ，上限 {{ formatBytes(mediaCache.stats.limit) }}
+                    </template>
+                  </span>
+                  <span>{{ mediaCache.stats.count }} 份</span>
+                </p>
+
+                <div class="row-actions">
+                  <button
+                    class="btn btn--sm"
+                    type="button"
+                    :disabled="mediaCache.busy"
+                    @click="mediaCache.refresh()"
+                  >
+                    <Icon name="refresh" :size="13" />
+                    <span>刷新</span>
+                  </button>
+                  <button
+                    class="btn btn--sm"
+                    type="button"
+                    :disabled="!mediaCache.hasCache"
+                    @click="openCacheDir"
+                  >
+                    <Icon name="folder-open" :size="13" />
+                    <span>打开文件夹</span>
+                  </button>
+                  <button
+                    class="btn btn--sm"
+                    type="button"
+                    :disabled="!mediaCache.hasCache || mediaCache.busy"
+                    @click="clearAllCache"
+                  >
+                    <Icon name="trash" :size="13" />
+                    <span>全部清除</span>
+                  </button>
+                </div>
+
+                <ul v-if="mediaCache.stats.files.length > 0" class="cache__list">
+                  <li v-for="item in mediaCache.stats.files" :key="item.name" class="cache__row">
+                    <span class="cache__from" :title="item.name">
+                      {{ item.source || '来源未知（本次启动前生成）' }}
+                    </span>
+                    <span class="cache__size mono">{{ formatBytes(item.bytes) }}</span>
+                    <span class="cache__when mono">{{ cacheWhen(item.mtime) }}</span>
+                    <button
+                      class="btn btn--sm btn--ghost"
+                      type="button"
+                      :disabled="mediaCache.busy"
+                      @click="removeCacheFile(item.name)"
+                    >
+                      删除
+                    </button>
+                  </li>
+                </ul>
+                <p v-else class="hint">暂无缓存。</p>
+
+                <p class="hint">超过 3 日未使用的缓存将会在软件运行时被清除。</p>
+                <p v-if="mediaCache.stats.limit > 0" class="hint">
+                  缓存超过空间上限后，将会清除部分当前未被使用的缓存以释放空间。
+                </p>
+              </div>
+            </section>
+
+            <!-- 识别：架构选择留在这里，其余识别参数在导入页（按架构分成两份面板） -->
             <section id="sec-recognize" class="block">
               <div class="block__head">
                 <Icon name="wave" :size="14" />
                 <span class="block__title">识别</span>
               </div>
               <div class="block__body">
-                <button class="btn btn--sm" type="button" @click="ui.navigate('home')">
-                  <Icon name="import" :size="13" />
-                  <span>前往导入页设置</span>
-                </button>
+                <label id="field-arch" class="field">
+                  <span class="field__label">识别架构</span>
+                  <select v-model="settings.arch" class="select">
+                    <option v-for="item in ARCH_OPTIONS" :key="item.value" :value="item.value">
+                      {{ item.label }}
+                    </option>
+                  </select>
+                  <span class="field__hint">{{ archHint }}</span>
+                </label>
+                <div class="row-actions">
+                  <button class="btn btn--sm" type="button" @click="ui.navigate('home')">
+                    <Icon name="sliders" :size="13" />
+                    <span>识别设置</span>
+                  </button>
+                </div>
               </div>
             </section>
           </div>
@@ -560,7 +754,7 @@ function reset(): void {
             <!-- 标点处理 -->
             <section id="sec-punctuation" class="block">
               <div class="block__head">
-                <Icon name="spell-check" :size="14" />
+                <Icon name="quote" :size="14" />
                 <span class="block__title">标点处理</span>
               </div>
               <div class="block__body">
@@ -1215,19 +1409,60 @@ function reset(): void {
   color: var(--color-text-tertiary);
 }
 
-/* 搜索跳转后的短暂高亮：目标区块描边 + 底色，1.6 秒后淡出 */
+/*
+ * 搜索跳转后的高亮：描边闪两次（淡入淡出），再淡出。
+ *
+ * 只动 box-shadow，不动 border-color —— 动画一结束 class 就被摘掉，中途把边框色
+ * 拉到 transparent 会让区块原本的边框先消失一下，看起来像布局抖了。
+ *
+ * 用 --color-accent 而不是 --color-accent-border：后者在浅色主题是 #c4c4c4，
+ * 白底上就是一条浅灰线，闪烁再久也谈不上「提醒」。accent 在两套主题下都够醒目。
+ *
+ * 时间轴（2.6s）：淡入 → 淡出 → 再淡入 → 长淡出。最后那一段占 1.35 秒，
+ * 是「提醒完了自己走开」，不是硬切。
+ *
+ * 缓动用 ease-in-out 而不是 --ease-out：后者的曲线是「起步极快、末尾渐停」，
+ * 套在每一段上会让第一次亮起在 200ms 内掉光，看着还是「闪一下」。
+ */
 .is-flash {
-  animation: settings-flash 1.6s var(--ease-out);
+  animation: settings-flash 2.6s ease-in-out;
+}
+
+/* 描边跟着元素的圆角走。`.field` 本身没有圆角也没有底色，跟着下拉框的圆角一起圆，
+   比一个方方正正的框套在圆角控件外面顺眼；区块自己的圆角不受影响。 */
+.field.is-flash {
+  border-radius: var(--radius-sm);
 }
 
 @keyframes settings-flash {
-  0%,
-  60% {
-    box-shadow: 0 0 0 2px var(--color-accent-border);
-    border-color: var(--color-accent-border);
+  0% {
+    box-shadow: 0 0 0 2px transparent;
+  }
+  12% {
+    box-shadow: 0 0 0 2px var(--color-accent);
+  }
+  30% {
+    box-shadow: 0 0 0 2px transparent;
+  }
+  48% {
+    box-shadow: 0 0 0 2px var(--color-accent);
   }
   100% {
-    box-shadow: none;
+    box-shadow: 0 0 0 2px transparent;
+  }
+}
+
+/*
+ * 减少动效偏好下换成静态描边。
+ *
+ * global.css 那段把所有动画压到 0.01ms，等于一次都不闪 —— 定位提示会整个消失。
+ * 「不想看动画」不等于「不需要知道跳到了哪里」，所以这里给一个不动的框，
+ * 由 2.6 秒后的定时器收走。
+ */
+@media (prefers-reduced-motion: reduce) {
+  .is-flash {
+    animation: none !important;
+    box-shadow: 0 0 0 2px var(--color-accent);
   }
 }
 
@@ -1278,6 +1513,95 @@ function reset(): void {
   gap: var(--space-2);
   flex-wrap: wrap;
   margin-top: var(--space-3);
+}
+
+/* ---------- 解码缓存 ---------- */
+
+/*
+ * 占用条。只表达「离上限还有多远」，不做分段配色：
+ * 超限时主进程已经动手淘汰了，用户看到的永远是 ≤100%，
+ * 变红反而会让人以为自己坏了。
+ */
+.cache__meter {
+  margin-top: var(--space-3);
+  height: 4px;
+  border-radius: var(--radius-pill);
+  background: var(--color-bg-subtle);
+  overflow: hidden;
+}
+
+.cache__fill {
+  display: block;
+  height: 100%;
+  background: var(--color-accent);
+  border-radius: var(--radius-pill);
+  transition: width var(--dur-base) var(--ease-out);
+}
+
+.cache__meter.is-over .cache__fill {
+  background: var(--color-warning);
+}
+
+.cache__stat {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin: var(--space-2) 0 0;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-tertiary);
+}
+
+.cache__stat strong {
+  color: var(--color-text-secondary);
+  font-weight: var(--weight-medium);
+}
+
+/*
+ * 列表自己滚：缓存可能有几十份，摊开会把整个设置页顶长，
+ * 而这块的正文只是「谁在占地方」，不需要一次看全。
+ */
+.cache__list {
+  margin: var(--space-3) 0 0;
+  padding: 0;
+  list-style: none;
+  max-height: 240px;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+}
+
+.cache__row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+}
+
+.cache__row + .cache__row {
+  border-top: 1px solid var(--color-border-subtle);
+}
+
+/* 源文件名可能很长：让它吃剩余宽度并省略，别把大小和时间挤走 */
+.cache__from {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cache__size {
+  flex: none;
+  color: var(--color-text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.cache__when {
+  flex: none;
+  color: var(--color-text-tertiary);
 }
 
 .punct-intro {

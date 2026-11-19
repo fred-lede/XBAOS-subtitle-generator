@@ -140,6 +140,28 @@ import type { PunctuationOptions, SubtitleSegment } from '../src/types'
 let pass = 0
 let fail = 0
 
+/**
+ * 导入页「识别设置」的全部源码 = 外壳 + 每份架构面板。
+ *
+ * 2026-11-18 起这一栏按架构分家（`components/recog/Recog*.vue`），字段不再写在
+ * HomeView 里。凡是「导入页必须有 X」的断言都该看这一整片，只看 HomeView 会
+ * 变成永远通过的空断言。按目录取文件，新加面板自动被覆盖。
+ */
+function readRecogSources(): Array<{ name: string; src: string }> {
+  const dir = new URL('../src/components/recog/', import.meta.url)
+  const panels = readdirSync(dir)
+    .filter((name) => name.endsWith('.vue') && name !== 'RecogSettings.vue')
+    .sort()
+    .map((name) => ({ name, src: readFileSync(new URL(name, dir), 'utf8') }))
+  return [{ name: 'HomeView.vue', src: readFileSync(new URL('../src/views/HomeView.vue', import.meta.url), 'utf8') }, ...panels]
+}
+
+/** 上面那份源码拼成一个字符串，用于「整块区域里出现过某句话」这类断言 */
+function recogText(): string {
+  return readRecogSources()
+    .map((item) => item.src)
+    .join('\n')
+}
 function check(name: string, cond: boolean, detail = ''): void {
   if (cond) {
     pass += 1
@@ -1555,7 +1577,7 @@ const OPT: PunctuationOptions = { zh: 'strip-split', en: 'keep' }
 {
   const readSource = (rel: string): string =>
     readFileSync(new URL(`../${rel}`, import.meta.url), 'utf8')
-  const home = readSource('src/views/HomeView.vue')
+  const home = recogText()
   check('场景切分开关已从 UI 隐藏', !home.includes('settings.vadSceneEnabled'))
   check('束搜索开关已从 UI 隐藏', !home.includes('settings.beamSearch'))
   check('低置信复核开关已从 UI 隐藏', !home.includes('settings.lowConfRescue'))
@@ -2599,7 +2621,7 @@ const OPT: PunctuationOptions = { zh: 'strip-split', en: 'keep' }
     /ipcMain\.handle\('models:resolve'/.test(mainModelsSrc) &&
       /ipcMain\.handle\('models:active'/.test(mainModelsSrc) &&
       /resolve: \(file\) => ipcRenderer\.invoke\('models:resolve', file\)/.test(preloadModelsSrc) &&
-      /active: \(id\) => ipcRenderer\.invoke\('models:active', id\)/.test(preloadModelsSrc),
+      /active: \(id, arch\) => ipcRenderer\.invoke\('models:active', id, arch\)/.test(preloadModelsSrc),
     '判定规则只能存一份，放主进程',
   )
   check(
@@ -2817,7 +2839,10 @@ const OPT: PunctuationOptions = { zh: 'strip-split', en: 'keep' }
   check(
     'MOV / M4V / MKV 在支持清单里，且写明是系统解码器',
     ['m4v', 'mov', 'mkv'].every((e) =>
-      new RegExp(`ext: '${e}'[\\s\\S]{0,120}?impl: 'Windows 系统解码器'`).test(supportedText),
+      // 只要求「impl 里出现『系统解码器』」——具体写「系统解码器」还是
+      // 「Windows 系统解码器」是文案自由，但绝不能写成某个自带库的名字：
+      // 写了库名就等于宣称自己实现了这条路
+      new RegExp(`ext: '${e}'[\\s\\S]{0,120}?impl: '[^']*系统解码器`).test(supportedText),
     ),
     '这三个容器里的音轨由系统解，本软件没有可写的库名；写作别的值等于宣称自带实现',
   )
@@ -2853,6 +2878,111 @@ const OPT: PunctuationOptions = { zh: 'strip-split', en: 'keep' }
     '少了这一步，m4a 的 <audio> 会报 DEMUXER_ERROR_NO_SUPPORTED_STREAMS',
   )
   /*
+   * ---- 试听缓存的清理时机（2026-11-17）
+   *
+   * 原来 `prune()` 挂在 `convert()` 里，等于「只有真的转一次码才顺手清一下」：
+   * 从不导入视频容器的用户永远等不到清理，缓存只增不减。现在挪到 `whenReady`
+   * 里，删目录也解释得通（见协议 4.5）。
+   */
+  const cacheSrc = readSource('electron/media-cache.js')
+  const mainSrcForCache = readSource('electron/main.js')
+  check(
+    '试听缓存在启动时清理，不挂在转码路径上',
+    /cache\.prune\(\{ exempt \}\)/.test(mainSrcForCache) && !/this\.pruned/.test(cacheSrc),
+    '挂在 convert 里的话，「只导入 mp3」的用户永远不会触发清理',
+  )
+  check(
+    '缓存保留期是 3 天',
+    /CACHE_TTL_MS = 3 \* 24 \* 60 \* 60 \* 1000/.test(cacheSrc),
+    '保留期拉长到两周时，一天两小时素材就能攒到 9GB，用户会觉得硬盘莫名满了',
+  )
+  check(
+    '缓存命中时把 mtime 往前推（否则常用那份会被当成过期删掉）',
+    /await fs\.utimes\(target/.test(cacheSrc) &&
+      // 不能再按天节流：保留期只有 3 天，节流一天等于把语义改成「最多 4 天」
+      !/TOUCH_INTERVAL_MS/.test(cacheSrc),
+    '清理判据是 mtime，命中不重写文件、mtime 就停在生成那一刻，第 4 天会误删',
+  )
+  check(
+    '转出新缓存后立刻检查上限，不等下次启动',
+    /void this\.enforceLimit\(\)/.test(cacheSrc),
+    '用户导一次大素材，从那一刻起磁盘就压在上限之上，直到下次开软件才回落',
+  )
+  check(
+    '启动清理能豁免「双击打开的那个工程」要用的缓存',
+    /keysOf\(await mediaPathsOfProject\(argvProject\)\)/.test(readSource('electron/main.js')) &&
+      /async keysOf\(paths\)/.test(cacheSrc),
+    '过期判断先于用户打开工程，不豁免的话打开的瞬间就得重新解码一遍',
+  )
+  check(
+    '缓存的源文件路径只由 pathFor 一处换算成键',
+    (cacheSrc.match(/createHash\('sha1'\)/g) ?? []).length === 1,
+    '哈希规则写两遍迟早算出不一样的值，豁免名单就会对不上',
+  )
+  /*
+   * ---- 解码缓存的可见与可清（2026-11-17）
+   *
+   * 这份缓存是**源采样率**的单声道 PCM：48kHz 一小时 345MB。只靠过期时间
+   * 管不住体积 —— 一天两小时视频就是 700MB。所以要有硬上限、有淘汰、有看得见的入口。
+   */
+  check(
+    '解码缓存有总量上限，且不是形同虚设的大数',
+    (() => {
+      const m = cacheSrc.match(/CACHE_MAX_BYTES = ([\d *]+)/)
+      if (!m) return false
+      const bytes = m[1]
+        .split('*')
+        .map((s) => Number(s.trim()))
+        .reduce((a, b) => a * b, 1)
+      // 上限本身要合理：小于 256MB 会一上线就删用户刚转的东西，大于 4GB 等于没设
+      return bytes >= 256 * 1024 * 1024 && bytes <= 4 * 1024 * 1024 * 1024
+    })(),
+    '没有上限时缓存只增不减；写成 512GB 这种量级等于根本没设',
+  )
+  check(
+    '超限按最久未用淘汰，且跳过本次运行用过的',
+    /if \(bytes <= CACHE_MAX_BYTES\) break/.test(cacheSrc) &&
+      /this\.touched\.has\(e\.name\)\) continue/.test(cacheSrc),
+    '正在播的那份被删掉，用户下次点播放就得等重新解码一遍',
+  )
+  check(
+    '删缓存只接受 basename 与 .wav 后缀',
+    /base !== name \|\| !base\.endsWith\('\.wav'\)/.test(cacheSrc),
+    '文件名来自渲染进程，../../Windows/System32/x.wav 这种拼法能删到目录外面',
+  )
+  check(
+    '底栏显示缓存占用，点击跳到设置里的解码缓存',
+    /statusbar__cache/.test(readSource('src/components/AppStatusBar.vue')) &&
+      /navigate\('settings', 'sec-cache'\)/.test(readSource('src/components/AppStatusBar.vue')),
+    '这个目录会自己长大，用户不该在硬盘报警时才发现它',
+  )
+  /*
+   * 只看 `.statusbar__cache { ... }` 这一个块：跨块的正则会被下面
+   * `:hover` 里那句 secondary 误满足，改回 tertiary 也照样绿。
+   *
+   * 判的是「不写死档位」：底栏底色在普通主题是 tertiary、毛玻璃主题是
+   * secondary，写死哪一档都会在另一种下跟旁边差一截。
+   */
+  const cacheCssBlock = (
+    readSource('src/components/AppStatusBar.vue').match(/\.statusbar__cache \{[\s\S]*?\n\}/) ?? ['']
+  )[0]
+  check(
+    '底栏缓存占用的颜色跟着状态栏走（不写死档位）',
+    /color: inherit;/.test(cacheCssBlock) && !/text-(secondary|tertiary)/.test(cacheCssBlock),
+    '底栏底色在两种主题下不同，写死一档就会有一边比旁边的字暗',
+  )
+  check(
+    '设置页有解码缓存区块，且能按锚点反查到「识别与性能」',
+    /id="sec-cache"/.test(readSource('src/views/SettingsView.vue')) &&
+      groupOfDomId('sec-cache') === 'engine',
+    '反查不到分组时，jumpToDomId 不会切分组，区块被 v-show 藏着 → 点了没反应',
+  )
+  check(
+    '搜索「缓存」能搜到这一项',
+    searchSettings('缓存').some((e) => e.section === 'sec-cache'),
+    '设置页有搜索框，新增的设置项不进索引就等于藏起来了',
+  )
+  /*
    * ---- 下载完整性（2026-11-04）
    *
    * 清单里每个文件都必须带真实 sha256。Hugging Face 的 LFS 对象 id 与 ModelScope 的
@@ -2885,18 +3015,32 @@ const OPT: PunctuationOptions = { zh: 'strip-split', en: 'keep' }
     '默认推荐的模型必须能从国内平台直接下载',
   )
   /*
-   * ---- 「固定单遍」口径一致（2026-11-04）
+   * ---- 「固定单遍」口径一致（2026-11-04，2026-11-18 随面板分家重写）
    *
-   * SenseVoice 是贪心 CTC，多跑几遍结果一样，所以 store 里把 passes 压成 1、
-   * 界面也写了「固定单遍识别」。可「约 ×3 耗时」那个标签仍按设置里的档位算 ——
-   * 同一块区域里三句话互相矛盾，用户只会得出「这软件在瞎说」的结论。
+   * SenseVoice 是贪心 CTC，多跑几遍结果一样。以前是一套 UI 靠能力位把这一栏
+   * 灰掉，还得额外把「约 ×3 耗时」改成 ×1，三处很容易对不上。现在识别设置
+   * 按架构分家：sherpa 那份面板压根没有这一栏，whisper 那份按档位算耗时。
+   * 所以守的是「面板里有没有这一栏」和「store 有没有把遍数压成 1」。
    */
-  const homeSrc = readSource('src/views/HomeView.vue')
+  const panelSrc = (name: string): string => readSource(`src/components/recog/${name}`)
+  const whisperSrc = panelSrc('RecogWhisper.vue')
+  const sherpaSrc = panelSrc('RecogSherpa.vue')
+  const noComment = (src: string): string =>
+    src.replace(/<!--[\s\S]*?-->/g, '').replace(/\/\*[\s\S]*?\*\//g, '')
   check(
-    '不支持多遍解码的模型按单遍显示耗时',
-    /model\.caps\.decode \? preset : \{ \.\.\.preset, timeFactor: 1 \}/.test(homeSrc) &&
-      /const depth = model\.caps\.decode \? settings\.reasoningDepth : 'standard'/.test(homeSrc),
-    '说明写「固定单遍」、store 传 1，标签却按三档算耗时，三处对不上',
+    'sherpa 面板没有推理深度这一栏',
+    !noComment(sherpaSrc).includes('推理深度') && !noComment(sherpaSrc).includes('reasoningDepth'),
+    '贪心 CTC 没有温度与束搜索，给一个能点但无效的档位只是骗人',
+  )
+  check(
+    'whisper 面板按档位显示耗时倍数',
+    /DEPTH_PRESETS\[settings\.reasoningDepth\]\.timeFactor/.test(whisperSrc),
+    '标签与档位必须是同一个来源，写死倍数迟早对不上',
+  )
+  check(
+    '识别时仍按能力把遍数压到 1',
+    /model\.caps\.decode \? preset\.passes : 1/.test(readSource('src/stores/project.ts')),
+    '手动把架构改成 sherpa 之后，界面已经不显示了，store 这里不能再跑三遍',
   )
   check(
     '「已下载但未启用」要在卡片上看得见',
@@ -4575,17 +4719,18 @@ const OPT: PunctuationOptions = { zh: 'strip-split', en: 'keep' }
    * 该改的要改，容易误伤的必须原样留着。只测前一半等于没测。
    */
   {
-    const homeSrc = readSource('src/views/HomeView.vue')
+    const recogSrc = recogText()
     const projSrc = readSource('src/stores/project.ts')
     /*
      * 这条守的是两套通道的分工：提示词只有一百多字预算，超出的词**不能消失**。
      * 界面要写明白「注入有限额、纠正用全量」，后端要真的拿全量词表去纠正。
+     * 认提示词的那份面板（whisper）负责讲预算，不认的那份（sherpa）只讲纠正。
      */
     check(
-      '首页讲清注入预算与全量热词后处理',
-      /PROMPT_BUDGET_CHARS/.test(homeSrc) &&
-        /超出的词仍全部参与识别后的同音纠正/.test(homeSrc) &&
-        /全量热词参与/.test(homeSrc),
+      '面板讲清注入预算与全量热词后处理',
+      /PROMPT_BUDGET_CHARS/.test(recogSrc) &&
+        /超出的词仍全部参与识别后的同音纠正/.test(recogSrc) &&
+        /全量热词参与/.test(recogSrc),
       '预算只约束注入，被截掉的词仍要在结果文本里生效',
     )
     check(
@@ -5018,15 +5163,21 @@ const OPT: PunctuationOptions = { zh: 'strip-split', en: 'keep' }
     '「将输出到 N 个目录 / 收起清单」这块是纯导航，已经删掉了',
   )
 
-  // 分离开关必须已经从折叠里挪出来：它藏在「高级选项」里时，没人找得到
-  const advAt = homeSrc.indexOf('class="adv field--wide"')
-  const spkAt = homeSrc.indexOf('settings.speakerDiarization')
-  check(
-    '分离开关不在高级选项里',
-    spkAt > 0 && advAt > 0 && spkAt < advAt,
-    `开关在 ${spkAt}、折叠在 ${advAt}`,
-  )
-  check('分离开关改名为「区分不同的讲话人」', /区分不同的讲话人/.test(homeSrc))
+  /*
+   * 分离开关必须已经从折叠里挪出来：它藏在「高级选项」里时，没人找得到。
+   * 面板分家之后这件事要在**每一份**面板里成立，只看 HomeView 等于没看。
+   */
+  const panels = readRecogSources().filter((item) => item.name.startsWith('Recog') && item.name !== 'RecogSettings.vue')
+  for (const { name, src } of panels) {
+    const advAt = src.indexOf('class="adv"')
+    const spkAt = src.indexOf('settings.speakerDiarization')
+    check(
+      `${name} 的分离开关不在高级选项里`,
+      spkAt > 0 && advAt > 0 && spkAt < advAt,
+      `开关在 ${spkAt}、折叠在 ${advAt}`,
+    )
+    check(`${name} 用的是「区分不同的讲话人」`, /区分不同的讲话人/.test(src))
+  }
 
   /*
    * 导入页的形态（2026-11-04 定）：素材区融合拖放与列表、一个入口通吃、
@@ -5053,14 +5204,15 @@ const OPT: PunctuationOptions = { zh: 'strip-split', en: 'keep' }
   )
   check(
     '批量处理方式归到设置里',
-    /批量处理方式/.test(homeSrc) && !/批量处理方式/.test(boardSrc),
+    /批量处理方式/.test(recogText()) && !/批量处理方式/.test(boardSrc),
     '它描述的是这一批怎么合成结果，属于设置而不是某个文件',
   )
+  const recogCss = readSource('src/styles/recog.css')
   check(
     '页面不整页滚动，改由两张卡片各自滚',
     /\.view--fill \.view__body \{[\s\S]{0,140}overflow: hidden/.test(homeSrc) &&
       /\.board__grid \{[\s\S]{0,160}overflow-y: auto/.test(boardSrc) &&
-      /\.settings \{[\s\S]{0,200}overflow-y: auto/.test(homeSrc),
+      /\.recog \{[\s\S]{0,200}overflow-y: auto/.test(recogCss),
     '整页一滚，两栏就失去了「各自独立」的意义',
   )
 }
@@ -5159,6 +5311,69 @@ const OPT: PunctuationOptions = { zh: 'strip-split', en: 'keep' }
     '没有任何一处 font-family 落到系统等宽字体',
     fontOffenders.length === 0,
     fontOffenders.join(' | ') || '界面字体唯一',
+  )
+}
+
+/* ------------------------------------------------------------ 图标与侧栏操作 */
+{
+  const iconSrc = readFileSync(new URL('../src/components/Icon.vue', import.meta.url), 'utf8')
+  const defined = new Set([...iconSrc.matchAll(/name === '([a-z-]+)'/g)].map((m) => m[1]))
+
+  const used = new Map<string, string[]>()
+  for (const rel of readdirSync(new URL('../src/', import.meta.url), { recursive: true }) as string[]) {
+    if (!/\.vue$/.test(rel)) continue
+    const text = readFileSync(new URL(`../src/${rel}`, import.meta.url), 'utf8')
+    for (const m of text.matchAll(/Icon name="([a-z-]+)"/g)) {
+      const hit = used.get(m[1]) ?? []
+      hit.push(String(rel).split(/[\\/]/).pop() ?? '')
+      used.set(m[1], hit)
+    }
+  }
+
+  /*
+   * 这一条守的是「拼错 / 用了还没画的图标」：那条分支落到 `v-else` 的方框，
+   * 编译不报错、界面也不报错 —— 只有用户看到一个小方块。已经踩过一次
+   * （`square`、`arrow-right` 两处都没定义）。
+   */
+  const missing = [...used.keys()].filter((name) => !defined.has(name))
+  check(
+    '用到的图标都有定义（否则静默画成兜底方框）',
+    missing.length === 0,
+    missing.map((n) => `${n} → ${used.get(n)?.join(',')}`).join(' | ') || `共 ${defined.size} 个图标`,
+  )
+
+  check(
+    '图标集是自绘 SVG，不含 emoji 与外部素材',
+    !/\p{Extended_Pictographic}/u.test(iconSrc) &&
+      !/<use\b/.test(iconSrc) &&
+      !/xlink:href/.test(iconSrc),
+    'emoji 会随平台渲染成彩色方块；<use>/外链会把别人的图标素材卷进产物',
+  )
+  check(
+    '图标声明里写明自绘口径与网格规格',
+    /24×24/.test(iconSrc) && /自绘/.test(iconSrc) && /不引用任何图标库/.test(iconSrc),
+    '「这不是描的别人素材」需要写在源码里，否则每次新增图标都只能靠记忆',
+  )
+
+  const fileTreeSrc = readFileSync(new URL('../src/components/FileTree.vue', import.meta.url), 'utf8')
+  check(
+    '侧栏能一键关闭全部项目，且走带确认的那条路',
+    /function closeAll[\s\S]{0,320}closeDraftsSafely/.test(fileTreeSrc),
+    '直接循环 closeDraft 会跳过「要不要保存」的询问',
+  )
+  check(
+    '单个项目也显示关闭叉',
+    !/v-if="rows\.length > 1"/.test(fileTreeSrc),
+    '只有一个项目时藏起叉，用户只能靠右键菜单关它',
+  )
+
+  const editorSrc = readFileSync(new URL('../src/views/EditorView.vue', import.meta.url), 'utf8')
+  check(
+    '工作台空态给了「打开项目」，不只是「去导入」',
+    /function openProjectFile/.test(editorSrc) &&
+      /class="editor__empty-actions"/.test(editorSrc) &&
+      /openProjectFile/.test(editorSrc),
+    '这是项目系统之前留下的空态，站在工作台的人有一半是来接着旧项目干活的',
   )
 }
 
@@ -6137,9 +6352,13 @@ const OPT: PunctuationOptions = { zh: 'strip-split', en: 'keep' }
     /project\.allFiles/.test(barSrc) &&
       /project\.allSegments/.test(barSrc) &&
       /project\.allDuration/.test(barSrc) &&
-      /project\.allPendingReview/.test(barSrc) &&
       !/project\.files\.length/.test(barSrc),
     '它在最外一层横跨全宽，说的就该是整个软件',
+  )
+  check(
+    '底栏不再报「N 个文件处理完成」',
+    !/allPendingReview/.test(barSrc) && !/个文件处理完成/.test(barSrc),
+    '识别完的文件在侧栏自己会变成「待查看」，底栏再报一遍只是噪音',
   )
 
   const workSrc = read('src/views/EditorView.vue')
@@ -6664,15 +6883,71 @@ const OPT: PunctuationOptions = { zh: 'strip-split', en: 'keep' }
   )
   check(
     '未保存的工程定期落盘，启动时恢复',
-    /autosave:peek/.test(mainSrc) &&
+    /autosave:list/.test(mainSrc) &&
       /restoreAutosave/.test(appSrc) &&
       /startAutosave/.test(appSrc),
     '睡眠唤醒后渲染进程重载，内存里的成果全没了',
   )
   check(
-    '正式保存成功后清掉自动草稿',
-    /autosave\?\.clear\(\)/.test(projectStoreSrc),
-    '不清的话下次启动会冒出一份旧副本，用户会以为项目被改回去了',
+    '自动草稿一个项目一份，不是只存当前那一个',
+    /for \(const d of pending\)/.test(projectStoreSrc) &&
+      /autosave\.write\(d\.id,/.test(projectStoreSrc) &&
+      /drafts\.value\.filter\(/.test(projectStoreSrc),
+    '同时开三个项目都有改动时，只救回当前那一个等于丢两份',
+  )
+  check(
+    '内容没改动就不重写草稿',
+    /d\.rev !== d\.autosavedRev/.test(projectStoreSrc) &&
+      /autosavedRev = rev/.test(projectStoreSrc),
+    'dirty 一旦为真就一直真：只看它的话，改完一个字后每 15 秒全量重写一遍',
+  )
+  check(
+    '正式保存成功后只清掉这一个项目的草稿',
+    /autosave\?\.clear\(activeDraftId\.value\)/.test(projectStoreSrc),
+    '清全部的话，侧栏里别的项目的未保存内容会被一起删掉',
+  )
+  check(
+    '关掉项目时销毁它的草稿',
+    /autosave\?\.clear\(id\)/.test(projectStoreSrc),
+    '留着的话下次启动又把用户已经关掉的工程端回来',
+  )
+  check(
+    '草稿用临时名替换，不留半截 JSON',
+    /const temp = `\$\{target\}\.\$\{process\.pid\}\.tmp`/.test(mainSrc) &&
+      /fs\.rename\(temp, target\)/.test(mainSrc),
+    '写一半被杀会留下解析不了的草稿，比没有草稿更糟',
+  )
+
+  /*
+   * 识别期间的可操作性。
+   *
+   * 「识别一开始，整个工作台就锁死」是队列与工程还没分家时代留下的规矩：
+   * 那时正在跑的条目就在活动工程里，切走会把进度算错。现在队列是独立的
+   * `intake`，成果按 `targetDraftId` 落地，与「此刻在看哪个项目」无关。
+   * 挡着的实际代价是半小时内连自己的老工程都翻不开。
+   */
+  const fnBody = (name: string, span = 1600): string =>
+    (projectStoreSrc.match(new RegExp(`function ${name}\\([\\s\\S]{0,${span}}?\\n  \\}`)) ?? [''])[0]
+  check(
+    '识别中也能切换项目',
+    !/recognizing/.test(fnBody('switchDraft')),
+    '一开识别就被锁在空项目上，侧栏里自己的工程一个都点不开',
+  )
+  check(
+    '识别中也能打开别的项目文件',
+    !/recognizing/.test(fnBody('openProject', 6000)),
+    '半小时的识别期间，用户连另一个 .xbsgp 都打不开',
+  )
+  check(
+    '识别中不许关掉「结果要落进去」的那个项目',
+    /recognizing\.value && id === recognitionDraftId\.value/.test(projectStoreSrc) &&
+      /recognitionDraftId\.value = targetDraftId/.test(projectStoreSrc),
+    '关掉它，下一份结果找不到落点就直接消失（条目已从队列摘走）',
+  )
+  check(
+    '识别收尾时松开那道闩',
+    /recognitionDraftId\.value = ''/.test(projectStoreSrc),
+    '不清的话，识别结束后那个项目永远关不掉',
   )
 
   const capTokensSrc = readSrc('src/styles/tokens.css')
@@ -6830,6 +7105,186 @@ const OPT: PunctuationOptions = { zh: 'strip-split', en: 'keep' }
     backendIntentToEngineBackend({
       backend: 'auto', arch: 'whisper', isWindows: true, gpuDisabled: true,
     }).disableGpu === false,
+  )
+}
+
+/* ------------------------------------------------ 识别设置按架构分家（2026-11-18） */
+
+/**
+ * 两套引擎能调的参数本来就不一样（提示词、解码参数、语言），共用一套 UI 只能靠
+ * 能力位把不支持的几项灰掉 —— 一屏里既有能用的也有永远用不上的。分家之后
+ * 每份面板只写这套引擎真有的东西，架构选择留给「自己放的模型」。
+ *
+ * 这一组守的是结构性的事：外壳按架构挑面板、没有模型时只给一句出口、
+ * 架构只有一个选择入口、新面板不会被漏掉。
+ */
+{
+  const readSource = (rel: string): string =>
+    readFileSync(new URL(`../${rel}`, import.meta.url), 'utf8')
+  const shell = readSource('src/components/recog/RecogSettings.vue')
+  const settingsSrc = readSource('src/stores/settings.ts')
+  const mainJs = readSource('electron/main.js')
+  const mapSrc = readSource('src/data/settingsMap.ts')
+
+  check(
+    '外壳按架构挑面板',
+    /const PANELS: Record<string, Component>/.test(shell) &&
+      /whisper: RecogWhisper/.test(shell) &&
+      /sherpa: RecogSherpa/.test(shell),
+    '新增架构时在这里登记一行，别在模板里写 if',
+  )
+  check(
+    '没登记的面板不冒充别的架构',
+    /const panel = computed\(\(\) => PANELS\[arch\.value\] \?\? null\)/.test(shell),
+    '默认落到 whisper 会让用户对着无效参数调半天',
+  )
+  check(
+    '没有模型时只给「请配置模型」与一个出口',
+    /请配置模型/.test(shell) && /ui\.navigate\('models'\)/.test(shell),
+    '识别设置全部取决于架构，没有模型时一个开关都不该显示',
+  )
+  check(
+    '缺模型只在主进程答过之后才算数',
+    /const missing = computed\(\(\) => ready\.value && entry\.value === null\)/.test(
+      readSource('src/stores/model.ts'),
+    ),
+    '浏览器预览没有桥，直接拿 entry 判空会让整页变空态',
+  )
+  check(
+    '架构选择只有一处入口（设置页）',
+    /id="field-arch"/.test(readSource('src/views/SettingsView.vue')) &&
+      !recogText().includes('settings.arch ='),
+    '面板里再放一个下拉框，两个入口迟早各改各的',
+  )
+  check(
+    '设置里有架构字段且默认自动',
+    /arch: ArchChoice/.test(settingsSrc) && /arch: 'auto'/.test(settingsSrc),
+  )
+  check(
+    '主进程按手动指定的架构覆盖判定结果',
+    /function applyArchOverride\(entry, arch\)/.test(mainJs) &&
+      /if \(!ARCH_INFO\[arch\] \|\| entry\.arch === arch\) return entry/.test(mainJs),
+    '只认两个合法值，垃圾值一律回落到自动判定',
+  )
+  check(
+    '转写与加载都带上了架构',
+    (mainJs.match(/resolveModelForRun\(opts\.model, opts\.arch\)/g) ?? []).length === 2 &&
+      (readSource('src/stores/project.ts').match(/arch: settings\.arch/g) ?? []).length === 2,
+    '界面选了架构却只传给一处，另一次识别会跑错引擎',
+  )
+  check(
+    '架构进得了设置搜索',
+    /id: 'arch'/.test(mapSrc) && /anchor: 'field-arch'/.test(mapSrc),
+    '搜「架构」「whisper」要能直接跳过去',
+  )
+
+  /*
+   * 面板样式全挂在 `.recog` 之下。recog.css 是全局样式表，漏一条没前缀的规则，
+   * 设置页同名的 `.field` 就会被改写 —— 症状出现在离改动很远的地方。
+   */
+  const recogCss = readSource('src/styles/recog.css')
+  const selectors = [...recogCss.replace(/\/\*[\s\S]*?\*\//g, '').matchAll(/(^|\})\s*([^{}@]+)\{/g)]
+    .flatMap((m) => m[2].split(',').map((s) => s.trim()))
+    .filter(Boolean)
+  const leaked = selectors.filter((s) => !s.startsWith('.recog') && !/^\d|^(from|to)$/.test(s))
+  check(
+    '识别设置样式全部以 .recog 开头',
+    leaked.length === 0,
+    leaked.length ? `漏了前缀：${leaked.slice(0, 5).join('、')}` : '',
+  )
+
+  // 两份面板都必须真的存在：目录里少了谁，外壳那边就是一片空白
+  const panelNames = readRecogSources().map((item) => item.name)
+  for (const name of ['RecogWhisper.vue', 'RecogSherpa.vue']) {
+    check(`面板存在：${name}`, panelNames.includes(name))
+  }
+
+  /* ---- 底栏、侧栏与定位高亮的常驻口径（2026-11-18） ---- */
+  const barSrc = readSource('src/components/AppStatusBar.vue')
+  check(
+    '底栏缓存读数常驻，没有缓存时显示 0 B',
+    /class="statusbar__cache"/.test(barSrc) && !/cache\.hasCache/.test(barSrc),
+    '忽隐忽现会让底栏右侧那一截长度跳变，用户每次都得重新找位置',
+  )
+
+  /*
+   * 定位高亮闪两次再淡出。1.6 秒亮一下太短 —— 用户还没把视线挪过去就结束了，
+   * 看起来只像界面重绘了一次。判据取「描边色出现两次、归零三次」。
+   */
+  const setSrc = readSource('src/views/SettingsView.vue')
+  const flashBlock = (setSrc.match(/@keyframes settings-flash \{[\s\S]*?\n\}/) ?? [''])[0]
+  check(
+    '定位高亮闪两次再淡出',
+    (flashBlock.match(/var\(--color-accent\)/g) ?? []).length === 2 &&
+      (flashBlock.match(/2px transparent/g) ?? []).length === 3 &&
+      /animation: settings-flash 2\.6s/.test(setSrc) &&
+      /const FLASH_MS = 2600/.test(setSrc),
+    '只亮一次等于没有提示；动画时长与摘 class 的定时器必须对齐',
+  )
+  check(
+    '高亮不动边框色',
+    !/border-color/.test(flashBlock),
+    '动画一结束就摘 class，中途把边框拉成透明会让区块原本的边框先消失一下',
+  )
+  check(
+    '减少动效下仍留一个静态描边',
+    /@media \(prefers-reduced-motion: reduce\)[\s\S]{0,200}\.is-flash[\s\S]{0,160}box-shadow/.test(
+      setSrc,
+    ),
+    '全局那段把所有动画压到 0.01ms，不留静态框等于定位提示整个消失',
+  )
+
+  const treeSrc = readSource('src/components/FileTree.vue')
+  check(
+    '侧栏三个工具按钮等距',
+    !/filetree__tool--end/.test(treeSrc) && /\.filetree__tools \{[\s\S]{0,140}gap: 2px/.test(treeSrc),
+    '一排图标里只要有一格间距不同，眼睛先看到的就是那处不齐',
+  )
+
+  /* ---- 游标键盘微调（2026-11-18） ---- */
+  const edSrc = readSource('src/views/EditorView.vue')
+  const edStore = readSource('src/stores/editor.ts')
+  const playerSrc = readSource('src/components/AudioPlayer.vue')
+  check(
+    '方向键微调游标，步长 0.1 秒',
+    /key === 'ArrowLeft' \|\| key === 'ArrowRight'/.test(edSrc) && /const NUDGE_SEC = 0\.1/.test(edSrc),
+    '步长写死在别处（例如乘倍速）时，用户量到的就不是 0.1 秒了',
+  )
+  check(
+    '方向键在输入框里让位',
+    /key === 'ArrowLeft' \|\| key === 'ArrowRight'[\s\S]{0,320}isTypingTarget\(event\.target\)/.test(edSrc),
+    '少了这道闸，输入框里按方向键会一边移文本光标一边挪游标',
+  )
+  check(
+    '长按自己排节奏，不认系统重复键',
+    /if \(event\.repeat\) return/.test(edSrc) &&
+      /NUDGE_HOLD_DELAY_MS/.test(edSrc) &&
+      /function startNudgeHold/.test(edSrc),
+    '系统重复键的首延迟与重复率由操作系统决定，快慢不可控',
+  )
+  check(
+    '松手与失焦都收手',
+    /window\.addEventListener\('keyup', onKeyup\)/.test(edSrc) &&
+      /window\.addEventListener\('blur', onWindowBlur\)/.test(edSrc) &&
+      /onBeforeUnmount[\s\S]{0,220}stopNudgeHold\(\)/.test(edSrc),
+    '丢一次 keyup（切窗口、切输入法）游标就会一直走',
+  )
+  check(
+    '显式跳转绕过差值死区',
+    /const seekSeq = ref\(0\)/.test(edStore) &&
+      /function seekTo\(sec: number, options: \{ pause\?: boolean \}/.test(edStore) &&
+      /syncAudioToPlayhead\(true\)/.test(playerSrc),
+    '0.1 秒比「差 0.15 秒才 seek」还小，走普通通道等于没按',
+  )
+  check(
+    '暂停补最后一帧不与显式跳转打架',
+    /editor\.seekSeq === appliedSeekSeq/.test(playerSrc),
+    '先停再跳时，补帧会把刚设好的目标位置盖回音频原来的位置',
+  )
+  check(
+    '快捷键一览里有方向键这一条',
+    /keys: \['←', '→'\]/.test(readSource('src/views/SettingsView.vue')),
+    '能用的快捷键没写进一览，用户只能自己试出来',
   )
 }
 

@@ -174,24 +174,40 @@ async function goto(cdp, url) {
   // 是同一个根因，bringToFront 一并解决。
   await cdp.send('Page.bringToFront').catch(() => {})
   const loaded = cdp.once('Page.loadEventFired')
+  const t0 = Date.now()
   await cdp.send('Page.navigate', { url })
   await loaded
-  // 等演示数据与图表绘制完成
-  await sleep(1200)
 
-  // 导航失败时 Chromium 会渲染自己的错误页，而错误页同样会触发 load 事件、
-  // 同样能截图成功。后面的选择器却会全部落空，表现出来是一堆莫名其妙的
-  // 「找不到第 3 条字幕行」，排查方向完全跑偏 —— 曾经真的被这个骗过一次：
-  // 服务没起来，6 张截图全是通过状态，里面全是 ERR_CONNECTION_REFUSED。
-  // 所以每次导航后先确认页面确实进了我们的应用。
-  const state = await cdp.evaluate(`(() => {
-    const app = document.querySelector('#app')
-    return {
-      chromeError: !!document.querySelector('#main-frame-error'),
-      appMounted: !!app && app.children.length > 0,
-      title: document.title,
-    }
-  })()`)
+  /*
+   * 等应用挂上。
+   *
+   * 原来是一句固定 `sleep(1200)` 就断言 `#app` 有子节点。Vite 的开发服务器是
+   * 按需编译的：全量跑几十个场景时，某个路由第一次被访问要现编一份 chunk，
+   * 1200ms 不一定够 —— 表现是随机某个场景报「页面未加载成功」，
+   * 而单独跑它必过（那次编译已经缓存了）。这种抖动最耗排查时间。
+   *
+   * 改成轮询：快则立刻往下走，慢则最多等 15 秒。Chromium 错误页仍是立刻失败 ——
+   * 那是真的没起来，等多久都没用。
+   *
+   * 顺便记一句：错误页也会触发 load 事件、也能截图成功，如果这里不查，
+   * 后面全是「找不到某个元素」，排查方向会完全跑偏（曾经因为服务没起，
+   * 6 张截图全是「通过」，里面却是 ERR_CONNECTION_REFUSED）。
+   */
+  const deadline = Date.now() + 15000
+  let state = { chromeError: false, appMounted: false, title: '' }
+  for (;;) {
+    state = await cdp.evaluate(`(() => {
+      const app = document.querySelector('#app')
+      return {
+        chromeError: !!document.querySelector('#main-frame-error'),
+        appMounted: !!app && app.children.length > 0,
+        title: document.title,
+      }
+    })()`)
+    if (state.chromeError || state.appMounted) break
+    if (Date.now() > deadline) break
+    await sleep(100)
+  }
 
   if (state.chromeError || !state.appMounted) {
     throw new Error(
@@ -200,9 +216,359 @@ async function goto(cdp, url) {
         '  通常是开发服务器没起来，先执行 npm run dev:ui',
     )
   }
+
+  // 挂上之后仍要给演示数据与图表留出绘制时间：总等待不少于原来的 1200ms
+  await sleep(Math.max(0, 1200 - (Date.now() - t0)))
 }
 
 const scenarios = {
+
+  /**
+   * 侧栏项目级操作条。
+   *
+   * 三个动作从「列表底部的两行文字按钮」搬到了搜索框下方、只留图标。
+   * 这一组断言守的是「搬完之后还找得到」：图标必须带 title（否则纯图标
+   * 等于没有说明），关闭叉必须在只有一个项目时也出现（以前要两个以上才给，
+   * 于是单项目只能靠右键菜单关）。
+   */
+  async 'sidebar-tools'(cdp) {
+    await goto(cdp, BASE + '/?demo=1&view=editor')
+    const info = await cdp.evaluate(`(() => {
+      const tools = [...document.querySelectorAll('.filetree__tool')]
+      return {
+        count: tools.length,
+        titles: tools.map((b) => b.title),
+        hasIcon: tools.every((b) => !!b.querySelector('svg')),
+        projects: document.querySelectorAll('.filetree__proj').length,
+        closes: document.querySelectorAll('.filetree__proj .filetree__close').length,
+        closeOpacity: (() => {
+          const el = document.querySelector('.filetree__proj .filetree__close')
+          return el ? getComputedStyle(el).opacity : null
+        })(),
+        oldButtons: document.querySelectorAll('.filetree__new').length,
+      }
+    })()`)
+    check('侧栏项目级操作是三个图标按钮', info.count === 3 && info.hasIcon, JSON.stringify(info.titles))
+    check(
+      '每个图标都有悬浮提示',
+      info.titles.every((t) => typeof t === 'string' && t.length > 0),
+      JSON.stringify(info.titles),
+    )
+    check('关闭全部项目的按钮在（提示里说清是全部）', info.titles.some((t) => t.includes('关闭全部')))
+    check('底部那两行文字按钮已撤掉', info.oldButtons === 0, `还有 ${info.oldButtons} 个`)
+    check(
+      '关闭叉与项目数一一对应（单项目也给）',
+      info.projects > 0 && info.closes === info.projects,
+      `项目 ${info.projects} 个，叉 ${info.closes} 个`,
+    )
+    check('关闭叉平时可见（不是只在悬停时冒出来）', Number(info.closeOpacity) > 0.2, `opacity=${info.closeOpacity}`)
+    // 顺带留一张图：三个按钮等距与「缓存 0 B」的常驻，都是靠看才看得出对不对的
+    await shot(cdp, 'sidebar-tools.png')
+  },
+
+  /**
+   * 工作台空态的两条路。
+   *
+   * 没有项目时以前只有「去导入」—— 那是还没有项目概念时的版本留下的。
+   * 现在并列给「打开项目」，因为站在工作台的人有一半是想接着旧项目干活。
+   */
+  async 'editor-empty-actions'(cdp) {
+    await goto(cdp, BASE + '/?view=editor')
+    const info = await cdp.evaluate(`(() => ({
+      empty: !!document.querySelector('.editor__empty'),
+      labels: [...document.querySelectorAll('.editor__empty button')].map((b) => b.textContent.trim()),
+      sameHeight: (() => {
+        const hs = [...document.querySelectorAll('.editor__empty-actions .btn')].map((b) =>
+          Math.round(b.getBoundingClientRect().height),
+        )
+        return hs.length === 2 && hs[0] === hs[1]
+      })(),
+    }))()`)
+    check('没有项目时工作台显示空态', info.empty === true)
+    check(
+      '空态同时给「去导入」和「打开项目」',
+      info.labels.includes('去导入') && info.labels.includes('打开项目'),
+      JSON.stringify(info.labels),
+    )
+    check('两个按钮同档高度（一行里不许混档）', info.sameHeight === true)
+  },
+
+  /**
+   * 游标键盘微调（2026-11-18）。
+   *
+   * 空格播放 / 暂停本来就有，这一轮加的是 ←/→：每下 0.1 秒，按住持续移动，
+   * 输入框里让位。四件事分开验，因为它们各自都会单独坏：
+   *
+   *   1. 单次位移正好 0.1 秒；
+   *   2. 按住多走几步（长按由自己定时器排节奏，不认系统重复键）；
+   *   3. 在输入框里按方向键不动游标（那是文本光标的活）；
+   *   4. 播放中按一下先暂停 —— 不暂停的话逐帧推进会把它写回去。
+   *
+   * 断言读的是 store 里的 `playheadSec`，不是截图：游标移动 0.1 秒在 1080p 的
+   * 一条时间轴上不到一个像素，看是看不出来的。
+   */
+  async 'editor-nudge'(cdp) {
+    await goto(cdp, BASE + '/?demo=1&view=editor')
+    await sleep(500)
+
+    const run = (body) =>
+      cdp.evaluate(`(() => {
+        const pinia = document.querySelector('#app').__vue_app__.config.globalProperties.$pinia._s
+        const project = pinia.get('project')
+        const editor = pinia.get('editor')
+        ${body}
+      })()`)
+
+    await run(`
+      const file = project.files.find((f) => f.status !== 'unsupported')
+      file.durationSec = 30
+      file.segments = [{ id: 'n1', start: 0, end: 30, text: '游标微调', origin: '游标微调', issues: [] }]
+      file.status = 'pending'
+      project.activeFileId = file.id
+      editor.isPlaying = false
+      editor.setPlayhead(10)
+    `)
+    await sleep(300)
+
+    /** 按一下就松：keyup 立刻停掉长按定时器，只留第一次位移 */
+    const tap = (key, target = 'window') => `(() => {
+      const el = ${target === 'window' ? 'window' : `document.querySelector(${JSON.stringify(target)})`}
+      if (!el) return 'no-target'
+      el.dispatchEvent(new KeyboardEvent('keydown', { key: ${JSON.stringify(key)}, bubbles: true, cancelable: true }))
+      el.dispatchEvent(new KeyboardEvent('keyup', { key: ${JSON.stringify(key)}, bubbles: true }))
+      return 'ok'
+    })()`
+
+    const right = await cdp.evaluate(tap('ArrowRight'))
+    const afterRight = await run('return editor.playheadSec')
+    check(
+      '按一下 → 游标前进 0.1 秒',
+      right === 'ok' && Math.abs(afterRight - 10.1) < 1e-6,
+      `${right} / playhead=${afterRight}`,
+    )
+
+    await cdp.evaluate(tap('ArrowLeft'))
+    await cdp.evaluate(tap('ArrowLeft'))
+    const afterLeft = await run('return editor.playheadSec')
+    check(
+      '按两下 ← 游标后退 0.2 秒',
+      Math.abs(afterLeft - 9.9) < 1e-6,
+      `playhead=${afterLeft}`,
+    )
+
+    // 0 处不许往负数走
+    await run('editor.setPlayhead(0)')
+    await cdp.evaluate(tap('ArrowLeft'))
+    const atZero = await run('return editor.playheadSec')
+    check('游标不会移到 0 之前', atZero === 0, `playhead=${atZero}`)
+
+    /*
+     * 输入框里让位：侧栏搜索框是工作台里现成的 <input>，焦点真的落上去之后
+     * 再按方向键 —— 这一步验证的是 `isTypingTarget` 这道闸，不是标签。
+     */
+    await run('editor.setPlayhead(5)')
+    const inInput = await cdp.evaluate(`(() => {
+      const el = document.querySelector('.filetree__search')
+      if (!el) return 'no-input'
+      el.focus()
+      el.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true }))
+      el.dispatchEvent(new KeyboardEvent('keyup', { key: 'ArrowRight', bubbles: true }))
+      return document.activeElement === el ? 'focused' : 'not-focused'
+    })()`)
+    const afterTyping = await run('return editor.playheadSec')
+    check(
+      '输入框里的方向键不动游标',
+      inInput === 'focused' && afterTyping === 5,
+      `${inInput} / playhead=${afterTyping}`,
+    )
+
+    // 播放中按方向键：先停，再挪。
+    // 演示数据没有真实音频，游标由 100ms 的定时器驱动，所以基准位置要按下之前现读 ——
+    // 写死 8 的话，等待那 150ms 里定时器已经把它推走了。
+    await run(`
+      editor.setPlayhead(8)
+      editor.isPlaying = true
+    `)
+    await sleep(150)
+    const playingFrom = await run('return editor.playheadSec')
+    await cdp.evaluate(tap('ArrowRight'))
+    const paused = await run('return { playing: editor.isPlaying, at: editor.playheadSec }')
+    const moved = paused.at - playingFrom
+    check(
+      '播放中按 → 会先暂停再往前挪一点',
+      paused?.playing === false && moved >= 0.1 - 1e-6 && moved <= 0.25,
+      `${playingFrom} → ${paused?.at}（${moved.toFixed(2)}）`,
+    )
+
+    /*
+     * 长按：按下不松 700ms。首延迟 300ms + 每步 55ms，加上第一下本身，
+     * 应当走 8 步上下。只断言「明显多于一步、又没有失控」—— 具体的毫秒数
+     * 取决于定时器精度，卡死数字等于给自己埋一条偶发失败。
+     */
+    const held = await cdp.evaluate(`(async () => {
+      const pinia = document.querySelector('#app').__vue_app__.config.globalProperties.$pinia._s
+      const editor = pinia.get('editor')
+      editor.setPlayhead(10)
+      const before = editor.playheadSec
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true }))
+      await new Promise((r) => setTimeout(r, 700))
+      window.dispatchEvent(new KeyboardEvent('keyup', { key: 'ArrowRight', bubbles: true }))
+      await new Promise((r) => setTimeout(r, 200))
+      return { before, after: editor.playheadSec }
+    })()`)
+    const steps = (held.after - held.before) / 0.1
+    check(
+      '按住 → 持续移动（700ms 至少五步）',
+      steps >= 5 && steps <= 20,
+      `${held.before} → ${held.after}（${steps.toFixed(1)} 步）`,
+    )
+
+    // 松手之后不许继续走
+    const afterRelease = await run('return editor.playheadSec')
+    await sleep(300)
+    const stillMoving = await run('return editor.playheadSec')
+    check('松手即停', Math.abs(stillMoving - afterRelease) < 1e-6, `${afterRelease} → ${stillMoving}`)
+  },
+
+  /**
+   * 识别设置按架构分家（2026-11-18）。
+   *
+   * 浏览器预览没有 Electron 桥，`models.active` 永远是 undefined，面板只会
+   * 停在「读不到主进程结论」的默认态 —— 三份面板里两份根本走不到。所以这里
+   * 注入一个假的 active 返回值，让外壳真的按架构挑一次面板：
+   *
+   *   · whisper  → 有推理深度、有提示词预算
+   *   · sherpa   → 没有推理深度、语言是只读一行、词库仍可勾
+   *   · 没有模型 → 只显示「请配置模型」和一个去模型页的按钮
+   *
+   * 断言的落点都在「这一份面板里有什么」而不是「某句话在不在」：
+   * 参数被塞错面板时，句子还在页面上，只有按面板取元素才看得出来。
+   */
+  async 'recog-arch'(cdp) {
+    const MODELS = {
+      whisper: {
+        entry: {
+          id: 'ggml-small.bin',
+          name: 'ggml-small',
+          path: 'D:/models/ggml-small.bin',
+          kind: 'file',
+          size: 466000000,
+          source: 'user',
+          builtin: true,
+          catalogKey: 'small',
+          variant: 'ggml',
+        },
+        arch: 'whisper',
+        archLabel: 'whisper.cpp（GGML）',
+        caps: { prompt: true, translate: true, decode: true, gpu: true },
+        archForced: false,
+      },
+      sherpa: {
+        entry: {
+          id: 'sensevoice-small',
+          name: 'sensevoice-small',
+          path: 'D:/models/sensevoice-small',
+          kind: 'dir',
+          size: 240000000,
+          source: 'user',
+          builtin: true,
+          catalogKey: 'sensevoice-small',
+          variant: 'sensevoice',
+        },
+        arch: 'sherpa',
+        archLabel: 'sherpa-onnx（ONNX Runtime）',
+        caps: { prompt: false, translate: false, decode: false, gpu: false },
+        archForced: false,
+      },
+      none: { entry: null, arch: '', archLabel: '', caps: { prompt: false, translate: false, decode: false, gpu: false }, archForced: false },
+    }
+
+    await cdp.send('Page.enable')
+    // 桥要早于 App 挂载：model.refresh() 是在 onMounted 里调的。
+    // 选哪份用 localStorage 传递 —— 注入脚本每次导航都在新的 JS 上下文里重跑，
+    // 靠 window 上的变量接力，一跳转就被重置回默认值（踩过）。
+    const injected = await cdp.send('Page.addScriptToEvaluateOnNewDocument', {
+      source: `(() => {
+        const table = ${JSON.stringify(MODELS)}
+        window.xbaos = {
+          models: {
+            setDir: () => Promise.resolve({ ok: true, dir: 'D:/models' }),
+            active: () => Promise.resolve(table[localStorage.getItem('__archProbe') || 'whisper'] || table.none),
+            refresh: () => Promise.resolve([]),
+          },
+        }
+      })()`,
+    })
+
+    const measure = `(() => {
+      const panel = document.querySelector('.recog')
+      if (!panel) return null
+      const labels = [...panel.querySelectorAll('.field__label')].map((el) => el.textContent.trim())
+      return {
+        empty: panel.classList.contains('recog--empty'),
+        labels,
+        hasDepth: labels.includes('推理深度'),
+        hasBudget: !!panel.querySelector('.lex-budget'),
+        language: (panel.querySelector('.select') || panel.querySelector('.recog__value') || {}).value ?? '',
+        languageText: (panel.querySelector('.recog__value') || {}).textContent ?? '',
+        lexes: panel.querySelectorAll('.lex').length,
+        meta: (document.querySelector('.recog__meta') || {}).textContent ?? '',
+        pager: !!panel.querySelector('.modes'),
+        emptyText: (panel.querySelector('.recog__empty-title') || {}).textContent ?? '',
+        emptyBtn: (panel.querySelector('.recog--empty .btn') || panel.querySelector('.btn') || {}).textContent ?? '',
+      }
+    })()`
+
+    const pick = async (which, shotName) => {
+      await cdp.evaluate(`(() => { localStorage.setItem('__archProbe', ${JSON.stringify(which)}); return true })()`)
+      await goto(cdp, BASE + '/')
+      await sleep(500)
+      if (shotName) await shot(cdp, shotName)
+      return cdp.evaluate(measure)
+    }
+
+    // 先落到一个真实页面上：场景刚开时标签页还停在 about:blank，
+    // 那里没有同源 localStorage，写标记会直接抛 SecurityError
+    await goto(cdp, BASE + '/')
+
+    const whisper = await pick('whisper', 'recog-whisper.png')
+    check('whisper 模型显示 whisper 面板', whisper?.empty === false && whisper?.hasDepth === true, JSON.stringify(whisper?.labels))
+    check('whisper 面板有提示词预算', whisper?.hasBudget === true)
+    check('whisper 面板的语言是可选下拉', whisper?.language === 'zh', String(whisper?.language))
+
+    const sherpa = await pick('sherpa', 'recog-sherpa.png')
+    check('SenseVoice 显示 sherpa 面板', sherpa?.empty === false && sherpa?.labels.length > 0, JSON.stringify(sherpa?.labels))
+    check('sherpa 面板没有推理深度', sherpa?.hasDepth === false, JSON.stringify(sherpa?.labels))
+    check('sherpa 面板不给提示词预算', sherpa?.hasBudget === false)
+    check('sherpa 面板的语言是只读一行', String(sherpa?.languageText).includes('自动'), String(sherpa?.languageText))
+    check('sherpa 面板的词库仍可勾选', sherpa?.lexes === 5, `词库 ${sherpa?.lexes} 个`)
+
+    const none = await pick('none', 'recog-no-model.png')
+    check('没有模型时只显示「请配置模型」', none?.empty === true && none?.emptyText === '请配置模型', JSON.stringify({ empty: none?.empty, t: none?.emptyText }))
+    check('空态里没有任何设置项', (none?.labels ?? []).length === 0, JSON.stringify(none?.labels))
+    check('空态给出去模型页的按钮', String(none?.emptyBtn).includes('模型管理'), String(none?.emptyBtn))
+
+    // 按钮真的能跳：点一下必须落到模型页（导航是 store 里的状态，不看 URL，
+    // 所以用模型页独有的标记来判）
+    const went = await cdp.evaluate(`(async () => {
+      const btn = [...document.querySelectorAll('.recog .btn')].find((b) => b.textContent.includes('模型管理'))
+      if (!btn) return 'no-button'
+      btn.click()
+      await new Promise((r) => setTimeout(r, 500))
+      return (document.querySelector('.own__title') || {}).textContent || 'no-model-page'
+    })()`)
+    check('点「打开模型管理」跳到模型页', String(went).includes('自己的模型'), String(went))
+
+    /*
+     * 收尾：把假桥与 localStorage 标记撤干净。
+     * `addScriptToEvaluateOnNewDocument` 是**累积**的，留着它后面每个场景都会
+     * 带上一份假的 models 桥 —— 那些场景要的是「浏览器预览没有桥」。
+     */
+    await cdp
+      .send('Page.removeScriptToEvaluateOnNewDocument', { identifier: injected.identifier })
+      .catch(() => {})
+    await cdp.evaluate(`(() => { localStorage.removeItem('__archProbe'); return true })()`)
+  },
 
   /**
    * AI 校对辅助窗口（?window=assist）。
@@ -1687,7 +2053,8 @@ const scenarios = {
       if (!body || !inner || panes.length < 2) return null
       const l = panes[0].getBoundingClientRect()
       const r = panes[1].getBoundingClientRect()
-      const settings = panes[1].querySelector('.settings')
+      // 识别设置按架构分成两份面板，滚动容器统一是 .recog（不再是 .settings）
+      const settings = panes[1].querySelector('.recog')
       const grid = panes[0].querySelector('.board__grid')
       return {
         cols: getComputedStyle(inner).gridTemplateColumns.trim().split(/\\s+/).filter(Boolean).length,
@@ -2884,6 +3251,17 @@ const scenarios = {
       `[...document.querySelectorAll('.setnav__item')].map((b) => b.textContent.replace(/\\s+/g, ''))`,
     )
     check('设置页有左侧分组导航', groups.length === 8, JSON.stringify(groups))
+
+    // 底栏缓存读数常驻：浏览器预览没有缓存，这里应当是 0 B 而不是整块消失
+    const cacheReadout = await cdp.evaluate(`(() => {
+      const el = document.querySelector('.statusbar__cache')
+      return el ? el.textContent.replace(/\s+/g, ' ').trim() : null
+    })()`)
+    check(
+      '没有缓存时底栏仍显示「缓存 0 B」',
+      typeof cacheReadout === 'string' && cacheReadout.includes('缓存') && cacheReadout.includes('0 B'),
+      JSON.stringify(cacheReadout),
+    )
     check('默认停在外观组', (await activeGroup()).includes('外观'), await activeGroup())
     check('同屏只显示一个分组', (await visibleGroups()) === 1, String(await visibleGroups()))
 
@@ -2913,6 +3291,104 @@ const scenarios = {
       return el ? el.classList.contains('is-flash') : false
     })()`)
     check('跳转后目标控件被高亮', flashed === true)
+
+    // 高亮是「闪两次再淡出」，不是亮一下就没了：旧实现 1.6 秒就摘 class，
+    // 用户还没把视线挪过去就已经结束。这里量两件事——动画本身是哪一个、持续多久。
+    const flashStyle = await cdp.evaluate(`(() => {
+      const el = document.getElementById('field-export-encoding')
+      if (!el) return null
+      const cs = getComputedStyle(el)
+      return { name: cs.animationName, dur: cs.animationDuration, shadow: cs.boxShadow }
+    })()`)
+    // scoped 样式会把 keyframes 改名成 `settings-flash-5e0b544f`，所以只比前缀
+    check(
+      '高亮用 2.6 秒的闪两次动画',
+      String(flashStyle?.name ?? '').startsWith('settings-flash') && flashStyle?.dur === '2.6s',
+      JSON.stringify(flashStyle),
+    )
+    // 截图留一份现场：放大的那张看描边，整页那张看它落在哪一块。
+    // 320ms 正好是第一次亮到顶的时候（关键帧 12%），拍淡出中途没有意义
+    await sleep(320)
+    const flashRect = await cdp.evaluate(`(() => {
+      const el = document.getElementById('field-export-encoding')
+      if (!el) return null
+      const r = el.getBoundingClientRect()
+      return { x: r.x, y: r.y, width: r.width, height: r.height }
+    })()`)
+    if (flashRect) {
+      await shot(cdp, 'settings-flash-zoom.png', {
+        x: Math.max(0, flashRect.x - 14),
+        y: Math.max(0, flashRect.y - 14),
+        width: flashRect.width + 28,
+        height: flashRect.height + 28,
+        scale: 2,
+      })
+    }
+    await shot(cdp, 'settings-flash.png')
+
+    /*
+     * 行为判据：自己重放一次，取四个时刻的描边不透明度 —— 亮、暗、再亮、淡出。
+     * 只比动画名与时长是不够的：一次亮起同样满足那两个值。
+     */
+    const pulses = await cdp.evaluate(`(async () => {
+      const el = document.getElementById('field-export-encoding')
+      if (!el) return null
+      const alpha = () => {
+        const m = getComputedStyle(el).boxShadow.match(/rgba?\(([^)]+)\)/)
+        if (!m) return 0
+        const parts = m[1].split(',').map((v) => Number(v))
+        return parts.length === 4 ? parts[3] : 1
+      }
+      el.classList.remove('is-flash')
+      void el.offsetWidth
+      el.classList.add('is-flash')
+      const wait = (ms) => new Promise((r) => setTimeout(r, ms))
+      const out = []
+      // 关键帧落在 12% / 30% / 48% / 100%，换成毫秒是 320 / 780 / 1250 / 2600
+      await wait(320)
+      out.push(alpha())
+      await wait(460)
+      out.push(alpha())
+      await wait(470)
+      out.push(alpha())
+      await wait(1150)
+      out.push(alpha())
+      return out
+    })()`)
+    check(
+      '高亮是亮、暗、再亮、淡出四次采样',
+      Array.isArray(pulses) && pulses[0] > 0.6 && pulses[1] < 0.2 && pulses[2] > 0.6 && pulses[3] < 0.3,
+      JSON.stringify(pulses),
+    )
+
+    /*
+     * 减少动效偏好：global.css 那段把所有动画压到 0.01ms，闪两次等于一次都不闪。
+     * 所以这里必须换成不动的描边 —— 「不想看动画」不等于「不需要知道跳到了哪里」。
+     * 顺带留一张静态图：没有动画时截图不会抓到淡出的中途，2px 描边长什么样一看便知。
+     */
+    await cdp.send('Emulation.setEmulatedMedia', {
+      features: [{ name: 'prefers-reduced-motion', value: 'reduce' }],
+    })
+    const reduced = await cdp.evaluate(`(async () => {
+      const el = document.getElementById('field-export-encoding')
+      if (!el) return null
+      el.classList.remove('is-flash')
+      void el.offsetWidth
+      el.classList.add('is-flash')
+      await new Promise((r) => setTimeout(r, 400))
+      const cs = getComputedStyle(el)
+      return { shadow: cs.boxShadow, anim: cs.animationName }
+    })()`)
+    check(
+      '减少动效下换成不动的描边',
+      reduced?.anim === 'none' &&
+        String(reduced?.shadow).includes('2px') &&
+        !/rgba\(0, 0, 0, 0\)|transparent/.test(String(reduced?.shadow)),
+      JSON.stringify(reduced),
+    )
+    await shot(cdp, 'settings-flash-reduced.png')
+    await cdp.send('Emulation.setEmulatedMedia', { features: [] })
+
 
     // 换一个词：验证同义词命中 + 跨组跳转
     await typeSearch('毛玻璃')
@@ -2996,6 +3472,80 @@ const scenarios = {
       Object.keys(localStorage).filter((k) => k.startsWith('xbaos.settings')).forEach((k) => localStorage.removeItem(k))
       return true
     })()`)
+  },
+
+  /**
+   * 解码缓存的设置区块（2026-11-17）。
+   *
+   * 这份缓存是源采样率的单声道 PCM，48kHz 一小时 345MB —— 它是软件里唯一会
+   * 自己长大的目录，所以必须有可见的占用与可点的清除。浏览器预览里没有主进程、
+   * 也没有 `media.cacheStats`，正好测「空态」这一支：区块在、三个按钮在、
+   * 全部清除是禁用的。
+   */
+  async 'cache-settings'(cdp) {
+    await goto(cdp, BASE + '/?demo=1&view=settings&theme=light')
+
+    const navPoint = await cdp.evaluate(`(() => {
+      const b = [...document.querySelectorAll('.setnav__item')].find((x) => x.textContent.includes('识别与性能'))
+      if (!b) return null
+      const r = b.getBoundingClientRect()
+      return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
+    })()`)
+    check('设置页能找到「识别与性能」分组', !!navPoint)
+    if (navPoint) await cdp.click(navPoint.x, navPoint.y)
+    await sleep(320)
+
+    const section = await cdp.evaluate(`(() => {
+      const el = document.getElementById('sec-cache')
+      if (!el) return null
+      return {
+        visible: el.offsetParent !== null,
+        title: el.querySelector('.block__title')?.textContent?.trim() ?? '',
+        meter: !!el.querySelector('.cache__meter'),
+        stat: el.querySelector('.cache__stat')?.textContent?.replace(/\\s+/g, '') ?? '',
+        buttons: [...el.querySelectorAll('.row-actions button')].map((b) => ({
+          text: b.textContent.replace(/\\s+/g, ''),
+          disabled: b.disabled,
+        })),
+        hint: el.querySelector('.hint')?.textContent?.replace(/\\s+/g, '') ?? '',
+      }
+    })()`)
+
+    check('「识别与性能」里有解码缓存区块', !!section && section.visible, JSON.stringify(section))
+    check('区块标题是「解码缓存」', section?.title === '解码缓存', section?.title)
+    check('有占用条与用量数字', !!section?.meter && (section?.stat ?? '').includes('已用'), section?.stat)
+    check(
+      '三个操作齐了：刷新 / 打开文件夹 / 全部清除',
+      (section?.buttons ?? []).map((b) => b.text).join(',') === '刷新,打开文件夹,全部清除',
+      JSON.stringify(section?.buttons ?? []),
+    )
+    check(
+      '浏览器预览没有缓存 → 清除与打开都禁用，且说明缓存只是中间产物',
+      (section?.buttons ?? []).slice(1).every((b) => b.disabled) &&
+        (section?.hint ?? '').includes('清除缓存不影响软件的正常功能'),
+      JSON.stringify({ buttons: section?.buttons, hint: section?.hint }),
+    )
+
+    // 从底栏那一行点进来也必须是同一块：锚点对不上就会滚到设置页顶部
+    const jumps = await cdp.evaluate(`(async () => {
+      const holder = document.querySelector('#app').__vue_app__.config.globalProperties.$pinia._s
+      const ui = holder.get('ui')
+      ui.navigate('settings', 'sec-cache')
+      await new Promise((r) => setTimeout(r, 420))
+      const el = document.getElementById('sec-cache')
+      return {
+        group: document.querySelector('.setnav__item.is-active')?.textContent?.replace(/\\s+/g, '') ?? '',
+        flashed: el?.classList.contains('is-flash') ?? false,
+        top: el ? Math.round(el.getBoundingClientRect().top) : -9999,
+      }
+    })()`)
+    check(
+      '按锚点 sec-cache 跳转：切到「识别与性能」并高亮该块',
+      (jumps?.group ?? '').startsWith('识别与性能') && jumps?.flashed === true,
+      JSON.stringify(jumps),
+    )
+
+    await shot(cdp, 'probe-settings-cache.png')
   },
 
   async 'accuracy-settings'(cdp) {
@@ -3855,7 +4405,7 @@ const scenarios = {
      * 下面那次装桩改成 Object.assign 合并，不要整个替换掉（会把回调句柄冲掉）。
      */
     await cdp.send('Page.enable')
-    await cdp.send('Page.addScriptToEvaluateOnNewDocument', {
+    const bridgeProbe = await cdp.send('Page.addScriptToEvaluateOnNewDocument', {
       source: `
         window.__progress = window.__progress || []
         window.__closeAcks = window.__closeAcks || 0
@@ -4424,6 +4974,19 @@ const scenarios = {
       Object.keys(localStorage).filter((k) => k.startsWith('xbaos.settings')).forEach((k) => localStorage.removeItem(k))
       return true
     })()`)
+
+    /*
+     * 撤掉装桩。
+     *
+     * `addScriptToEvaluateOnNewDocument` 是**累积**的：留着它，后面每个场景
+     * 都会带着一个 `window.xbaos` 启动，浏览器预览被当成 Electron —— 拖文件
+     * 走 bridge 分支（拿不到真实路径，队列永远是空的）、识别走真引擎分支
+     * （浏览器里没有引擎，直接报「识别中断」）。这个泄漏真的把 `recognize-switch`
+     * 顶成了假失败：单跑全绿、整轮必挂。
+     */
+    await cdp
+      .send('Page.removeScriptToEvaluateOnNewDocument', { identifier: bridgeProbe.identifier })
+      .catch(() => {})
   },
 
   /**
@@ -5595,6 +6158,125 @@ const scenarios = {
     )
     // 复位：模拟设置是会话级的，不撤掉会影响后面所有场景
     await cdp.send('Emulation.setEmulatedMedia', { features: [] })
+  },
+
+  /**
+   * 识别期间还能不能用自己的工程。
+   *
+   * 旧规矩是「识别中不许切项目」，理由写作「正在跑的那一条属于当前项目」——
+   * 那是队列与工程还没分家时的结论。如今正在跑的那条在 `intake` 里，成果按
+   * `targetDraftId` 落地，与「此刻在看哪个项目」毫无关系。规矩却留着，代价是：
+   * 一按开始识别，侧栏里自己的老工程全部点不开，跑多久就得干等多久。
+   */
+  async 'recognize-switch'(cdp) {
+    await goto(cdp, `${BASE}/?demo=1&view=editor&theme=light`)
+    if (
+      !(await waitFor(
+        cdp,
+        `document.querySelectorAll('.subtable__body .row').length > 0`,
+        15000,
+        200,
+      ))
+    ) {
+      throw new Error('演示项目没有加载出字幕行')
+    }
+    const before = await cdp.evaluate(`(() => ({
+      rows: document.querySelectorAll('.subtable__body .row').length,
+      projects: document.querySelectorAll('.filetree__proj').length,
+    }))()`)
+    check('先有一个打开着的项目', before.projects === 1 && before.rows > 0, JSON.stringify(before))
+
+    // 再拖三条音频进来（浏览器预览拿不到真实路径，走演示工厂）
+    const dropped = await cdp.evaluate(`(() => {
+      const dt = new DataTransfer()
+      for (const n of ['会议录音一.wav', '会议录音二.wav', '会议录音三.wav']) {
+        dt.items.add(new File([new Uint8Array(2048)], n, { type: 'audio/wav' }))
+      }
+      window.dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true }))
+      return dt.files.length
+    })()`)
+    check('三条音频进了待识别队列', dropped === 3, String(dropped))
+
+    const clickText = async (selector, label) => {
+      const p = await cdp.evaluate(`(() => {
+        const el = [...document.querySelectorAll(${JSON.stringify(selector)})]
+          .find((b) => b.textContent.replace(/\\s+/g, '').includes(${JSON.stringify(label)}))
+        if (!el) return null
+        el.scrollIntoView({ block: 'center' })
+        const r = el.getBoundingClientRect()
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }
+      })()`)
+      if (!p) throw new Error(`找不到「${label}」`)
+      await cdp.click(p.x, p.y)
+    }
+
+    await clickText('.sidebar__item', '导入')
+    const startable = await waitFor(
+      cdp,
+      `(() => {
+        const b = [...document.querySelectorAll('.view__foot .btn')].find((x) => x.textContent.includes('开始识别'))
+        return !!b && !b.disabled
+      })()`,
+      15000,
+      200,
+    )
+    check('导入页可以开始识别', startable === true)
+    await clickText('.view__foot .btn', '开始识别')
+
+    // 等飞行落地（那 460ms 里「取消」是隐去的），再进工作台
+    const started = await waitFor(
+      cdp,
+      `[...document.querySelectorAll('.view__foot .btn')].some((b) => b.textContent.includes('取消'))`,
+      15000,
+      100,
+    )
+    check('识别确实跑起来了', started === true)
+
+    await clickText('.view__foot .btn', '去工作台')
+    const emptySays = await waitFor(
+      cdp,
+      `document.querySelector('.editor__empty-title')?.textContent?.includes('正在识别') === true`,
+      8000,
+      100,
+    )
+    check('识别中进工作台，新项目空着但说明自己在识别', emptySays === true)
+
+    const bar = await cdp.evaluate(`(() => {
+      const all = [...document.querySelectorAll('.filetree__proj')]
+      const target = all.find((b) => !b.classList.contains('is-active'))
+      if (!target) return { count: all.length, point: null }
+      const r = target.getBoundingClientRect()
+      // 点左侧：右边是关闭按钮，点到就把项目关了
+      return { count: all.length, point: { x: Math.round(r.left + 40), y: Math.round(r.top + r.height / 2) } }
+    })()`)
+    check('侧栏里两个项目都在（老项目没有被吞掉）', bar.count === 2 && bar.point !== null, JSON.stringify(bar))
+
+    if (bar.point) await cdp.click(bar.point.x, bar.point.y)
+    /*
+     * 判据必须**同时**要求「字幕出来了」与「识别还在跑」。
+     *
+     * 只看前者是等得住的：旧代码里切不过去，等这轮识别跑完（三条音频 6.6 秒）
+     * 界面照样会自己跳到工程上，断言就假通过了 —— 实测过，这一条骗过了一次。
+     */
+    const switched = await waitFor(
+      cdp,
+      `(() => document.querySelectorAll('.subtable__body .row').length > 0
+        && !!document.querySelector('.statusbar__progress'))()`,
+      2500,
+      100,
+    )
+    const after = await cdp.evaluate(`(() => ({
+      rows: document.querySelectorAll('.subtable__body .row').length,
+      recognizing: !!document.querySelector('.statusbar__progress'),
+      toast: [...document.querySelectorAll('.toast')].map((t) => t.textContent).join(' | '),
+    }))()`)
+    check(
+      '识别中能切回老项目，字幕照常显示',
+      switched === true && after.rows > 0,
+      JSON.stringify(after),
+    )
+    check('切过去时识别还在跑（读的是被放行的这一刻）', after.recognizing === true, JSON.stringify(after))
+    check('不再弹「完成后再切换项目」', !after.toast.includes('完成后再切换'), after.toast)
   },
 
   /**

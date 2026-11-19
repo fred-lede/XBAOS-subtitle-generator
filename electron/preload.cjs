@@ -144,6 +144,9 @@ contextBridge.exposeInMainWorld('xbaos', {
   // 否则试听没声音、波形也是空的。其余格式返回 path:null，渲染层直接读源文件。
   media: {
     playable: (p, ext) => ipcRenderer.invoke('media:playable', p, ext),
+    // 解码缓存的占用与清理（设置页的「解码缓存」、底栏的占用提示都用它）
+    cacheStats: () => ipcRenderer.invoke('media:cache-stats'),
+    clearCache: (names) => ipcRenderer.invoke('media:cache-clear', names),
   },
 
   // ---- 文件系统（受限：只暴露这几个操作）
@@ -169,9 +172,9 @@ contextBridge.exposeInMainWorld('xbaos', {
 
   // ---- 自动草稿（防丢）：未保存的工程定期落盘，下次启动恢复
   autosave: {
-    peek: () => ipcRenderer.invoke('autosave:peek'),
-    write: (text) => ipcRenderer.invoke('autosave:write', text),
-    clear: () => ipcRenderer.invoke('autosave:clear'),
+    list: () => ipcRenderer.invoke('autosave:list'),
+    write: (id, text, meta) => ipcRenderer.invoke('autosave:write', id, text, meta),
+    clear: (id) => ipcRenderer.invoke('autosave:clear', id),
   },
 
   // ---- 项目文件（.xbsgp）
@@ -273,11 +276,14 @@ contextBridge.exposeInMainWorld('xbaos', {
     /** 在系统文件管理器里打开模型文件夹 */
     openDir: () => ipcRenderer.invoke('model:openDir'),
     /**
-     * 当前生效模型与架构 `{ entry, arch, archLabel, caps }`。
+     * 当前生效模型与架构 `{ entry, arch, archLabel, caps, archForced }`。
      * 传设置里存的模型标识；主进程负责判定架构并记住 ——
      * 界面不要自己按文件名猜架构。
+     *
+     * 第二个参数是用户在设置里手动指定的架构（`auto` / `whisper` / `sherpa`）：
+     * 只用于「自己放的模型自动判定不出来」，传 `auto` 或空值即完全交给主进程。
      */
-    active: (id) => ipcRenderer.invoke('models:active', id),
+    active: (id, arch) => ipcRenderer.invoke('models:active', id, arch),
     /** 重新扫一遍模型目录（用户在资源管理器里动了文件之后用） */
     refresh: () => ipcRenderer.invoke('models:refresh'),
     /**
