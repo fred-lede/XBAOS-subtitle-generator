@@ -478,6 +478,10 @@ export interface XbaosBridge {
 
   window: {
     control: (action: 'minimize' | 'maximize' | 'close') => void
+    /** 标题栏按钮由系统绘制（Windows 的 Window Controls Overlay），界面不再自绘 */
+    nativeChrome: boolean
+    /** 系统按钮的符号色；主题变化时把算好的颜色报给主进程 */
+    setOverlay: (colors: { symbolColor: string }) => void
     onStateChange: (cb: (state: { maximized: boolean; fullScreen: boolean }) => void) => () => void
   }
 
@@ -521,6 +525,23 @@ export interface XbaosBridge {
     }) => Promise<{ index: number; checked: boolean }>
   }
 
+  media: {
+    /**
+     * 取一份 Chromium 能播的音频。
+     *
+     * m4a / mp4 / aac 这类格式包内 ffmpeg 解不了，主进程会调引擎（系统解码器）
+     * 生成 WAV 缓存并返回它的路径；其余格式返回 `path: null`，表示直接读源文件。
+     * 失败时 `ok:false` 且带可读的 `message`，调用方据此提示而不是统一报「没有音轨」。
+     */
+    playable: (
+      p: string,
+      ext: string,
+    ) => Promise<
+      | { ok: true; path: string | null; cached: boolean }
+      | { ok: false; message: string }
+    >
+  }
+
   fs: {
     exists: (p: string) => Promise<boolean>
     stat: (p: string) => Promise<{
@@ -536,6 +557,19 @@ export interface XbaosBridge {
     readTextAuto: (p: string) => Promise<{ text: string; encoding: 'utf-8' | 'utf-8-bom' | 'gbk' }>
     /** 读取整个文件的二进制内容，用于音频解码与播放 */
     readArrayBuffer: (p: string) => Promise<ArrayBuffer>
+    /**
+     * 导出音频的中间段：字节落到系统临时目录，返回临时文件路径。
+     * 路径由主进程决定，渲染层拿不到 `app.getPath('temp')`。
+     */
+    writeAudioChunk: (bytes: Uint8Array, seq: number) => Promise<string>
+    /**
+     * 按顺序拼接若干 WAV。规格（采样率 / 声道 / 位深）必须一致，
+     * 不一致会 reject。收尾会删掉 `parts` 里的中间文件。
+     */
+    concatWav: (
+      parts: string[],
+      outPath: string,
+    ) => Promise<{ path: string; bytes: number; seconds: number }>
     /** 返回真正写入的路径 */
     writeText: (p: string, content: string) => Promise<string>
     /**
@@ -551,6 +585,19 @@ export interface XbaosBridge {
     openPath: (p: string) => Promise<string>
     basename: (p: string) => Promise<string>
     dirname: (p: string) => Promise<string>
+  }
+
+  /**
+   * 自动草稿（防丢）。
+   *
+   * 未保存的工程定期写到 `userData/autosave/draft.xbsgp`，下次启动发现就恢复。
+   * 存的是标准 `.xbsgp` 文本，恢复时走正常打开流程，不另立格式。
+   */
+  autosave: {
+    /** 有没有可恢复的草稿。path 给的是主进程算出的位置，渲染层不拼路径 */
+    peek: () => Promise<{ exists: boolean; path: string; savedAt: number }>
+    write: (text: string) => Promise<boolean>
+    clear: () => Promise<boolean>
   }
 
   /**

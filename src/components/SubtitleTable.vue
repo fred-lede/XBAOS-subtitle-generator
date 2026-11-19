@@ -107,7 +107,19 @@ const markIds = computed<string[]>(() => {
   const list = segments.value
   const hits: string[] = []
   for (const s of list) {
-    if (t >= s.start && t <= s.end) {
+    /*
+     * 区间取 **左闭右开**：`[start, end)`。
+     *
+     * 相邻两条的接缝处（甲.end === 乙.start）游标正好站在上面时，闭区间会让
+     * 两条同时命中、下面冒出两个三角，而屏幕上那一瞬间只可能"在听一条"。
+     * 右开之后功劳归下一条 —— 游标一进入乙的区间就指乙，符合"接下来要念的是
+     * 乙"这个直觉。真正的重叠（甲 [0,4) 与乙 [1,5) 在 2 秒处）不受影响，
+     * 那两条本来就同时存在，两个三角是对的。
+     *
+     * 末尾那一刻（t === 全长）没有任何一条开区间能命中，会落到下面的
+     * 「最近吸附」分支，照样指回最后一条，不会出现空三角。
+     */
+    if (t >= s.start && t < s.end) {
       hits.push(s.id)
       if (hits.length >= MAX_MARKS) break
     }
@@ -708,7 +720,22 @@ const hasAnyTranslation = computed(() =>
   segments.value.some((s) => Object.keys(s.translations ?? {}).length > 0),
 )
 
-const showSourceRow = computed(() => settings.subtitleView !== 'translation')
+/**
+ * 当前**实际呈现**的显示方式。
+ *
+ * `settings.subtitleView` 是用户偏好，会记到下次启动；但偏好 ≠ 眼下能看到什么：
+ * 一条译文都没有的工程（刚识别完、还没翻译）里，「双语」「仅译文」无从显示。
+ * 这时如果还按偏好把滑块停在「双语」，界面就成了「只显示一种语言，却标着双语」——
+ * 从有译文的工程切到没译文的工程时看到的就是这个。
+ *
+ * 所以渲染与滑块一律取这个有效值，而**不回写**偏好：用户上次选的双语，
+ * 等这次翻译完还要接着用。
+ */
+const viewMode = computed<SubtitleViewMode>(() =>
+  hasAnyTranslation.value ? settings.subtitleView : 'source',
+)
+
+const showSourceRow = computed(() => viewMode.value !== 'translation')
 
 /**
  * 进入文本编辑。单击文本即触发，光标落在点击处；
@@ -1088,7 +1115,7 @@ function onKeydown(event: KeyboardEvent): void {
       // 在「仅译文」视图下 F2 该进译文行 —— 那时原文行根本没渲染出来，
       // 却把编辑态指向它，用户会看到「按了没反应」
       const slot =
-        settings.subtitleView === 'translation' && trLang.value ? trLang.value : SOURCE_SLOT
+        viewMode.value === 'translation' && trLang.value ? trLang.value : SOURCE_SLOT
       void beginEdit(currentId, slot)
     }
   } else if (event.key === 'Delete' || event.key === 'Backspace') {
@@ -1170,13 +1197,15 @@ function onKeydown(event: KeyboardEvent): void {
 
       <span class="spacer" />
 
-      <!-- 显示方式：纯视图状态，不动数据、也不影响导出 -->
+      <!-- 显示方式：纯视图状态，不动数据、也不影响导出。
+           选中态取 `viewMode`（有效值）而不是 `settings.subtitleView`：没有译文时
+           偏好可能还停在「双语」，滑块画在双语上就与眼前的单语内容对不上了 -->
       <span v-seg-thumb class="viewtoggle" role="group" aria-label="显示方式">
         <button
           v-for="opt in VIEW_OPTIONS"
           :key="opt.value"
           class="viewtoggle__item"
-          :class="{ 'is-active': settings.subtitleView === opt.value }"
+          :class="{ 'is-active': viewMode === opt.value }"
           type="button"
           :disabled="opt.value !== 'source' && !hasAnyTranslation"
           :title="
@@ -1357,7 +1386,7 @@ function onKeydown(event: KeyboardEvent): void {
 
             <!-- 译文行：挂在上面那条原文上，靠左侧竖线区分 -->
             <span
-              v-if="settings.subtitleView !== 'source' && hasTrRow(seg)"
+              v-if="viewMode !== 'source' && hasTrRow(seg)"
               class="textline textline--tr"
               :class="{ 'is-stale': isStale(seg, trLang) }"
               :title="
@@ -1517,7 +1546,23 @@ function onKeydown(event: KeyboardEvent): void {
   cursor: not-allowed;
 }
 
+/*
+ * 选中条数：给它一个**稳定的槽宽**。
+ *
+ * 文案在「未选择 / 已选 3 条 / 已选 12 条」之间变化，宽度一变，右边这组控件
+ * 就被推着左右横移。工具栏本身不换行、只横向滚动，所以只要整条被内容撑满
+ * （窗口偏窄时是常态），计数多一个数字就会把显示方式连同它的滑块一起挤走 ——
+ * 用户看到的就是「选了字幕，那个滑块就偏了」。
+ *
+ * 定宽到能装下三位数，右边的分段控件就不再随选中数量挪窝。数字用等宽字形，
+ * 从 11 条到 12 条也不会抖一下。
+ */
 .op--count {
+  flex: none;
+  /* 三位数也装得下（「已选 999 条」约 77px）：再宽没必要占地方 */
+  min-width: 78px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
   color: var(--color-text-tertiary);
   cursor: default;
 }

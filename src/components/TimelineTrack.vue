@@ -12,7 +12,7 @@
  * 三层共用同一个坐标映射 `x(t) = (t - viewStartSec) * pxPerSec`，
  * 这是整块界面唯一的「时间 ↔ 像素」换算，任何交互都走它，不各算各的。
  */
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useProjectStore } from '@/stores/project'
 import { useEditorStore } from '@/stores/editor'
 import { useSettingsStore } from '@/stores/settings'
@@ -165,6 +165,79 @@ function clampPanGoal(): void {
   panGoalSec = Math.min(Math.max(0, panGoalSec), maxStart)
 }
 
+/*
+ * ---- 初次加载的视窗 ----
+ *
+ * 这一段必须**留在所有会用到它的 watcher 之前**。`viewFileId` 那个 watcher
+ * 是 `{ immediate: true }`，在 setup 期间就会跑一次并过来摆视窗；把 `let`
+ * 声明放到文件末尾，那一次访问就撞在暂时性死区上（`Cannot access
+ * 'userZoomed' before initialization`），整个组件 setup 抛错、编辑页直接
+ * 退回导入页 —— 报错在别的页面，看着完全不像时间轴的问题。
+ */
+
+/*
+ * 初次加载的缩放：**一屏一分钟**，不是「整条塞满」。
+ *
+ * 硬编「适应宽度」在十几分钟的音频上会把所有字幕块压成一条白线 —— 那条白线
+ * 既不像字幕也不像波形，用户第一眼不知道它是什么。所以按总长算：
+ * 短于一分钟的直接铺满（本来就看得清），超过的就只显示前 `INITIAL_SPAN_SEC` 秒。
+ *
+ * 上限仍受 `maxZoom` 约束（视窗至少留 `MIN_VISIBLE_SEC`），改这里不会越界。
+ */
+const INITIAL_SPAN_SEC = 60
+
+function initialZoom(): number {
+  const d = duration.value
+  if (!(d > INITIAL_SPAN_SEC)) return 1
+  return Math.min(maxZoom.value, d / INITIAL_SPAN_SEC)
+}
+
+/**
+ * 待摆的初始缩放。
+ *
+ * 时长有两条来路：一是 `viewFile.durationSec`（打开已识别的工程时就有），
+ * 二是波形解码完才回填的 `peaks.durationSec`（刚导入的音频只有后者）。
+ * 后者还没到位时 `duration` 是 0，只能先按 1 摆着，等时长到了再摆一次 ——
+ * 否则「刚识别完切过去」这一路会停在全览上。
+ */
+let autoFitPending = false
+
+/**
+ * 用户动过缩放或平移没有。
+ *
+ * 在用户表态之前，视窗应该一直跟着「当前该看的时间尺度」走：时长从
+ * 106 秒变成 30 秒（换素材、清空条目重注入），还按旧倍率算的话视窗只剩
+ * 十几秒，后面的条目直接被当成「在视窗外」不渲染了。
+ *
+ * 一旦他滚过滚轮、拖过时间轴、点过适应宽度，这个标记就立起来，之后
+ * 时长再怎么变都不动他的画面。
+ */
+let userZoomed = false
+
+function applyInitialFit(): void {
+  const z = initialZoom()
+  zoom.value = z
+  zoomGoal = z
+  viewStartSec.value = 0
+  panGoalSec = 0
+  clampView()
+  clampPanGoal()
+  if (duration.value > 0) autoFitPending = false
+  scheduleDraw()
+}
+
+/**
+ * 复位到「该看的时间尺度」。
+ *
+ * 换文件走这里而不是 `resetZoom()`：换到一段十几分钟的音频，适应宽度等于
+ * 又把字幕压成一条白线，和初次加载的病是同一个。
+ */
+function resetViewToFit(): void {
+  autoFitPending = true
+  userZoomed = false
+  applyInitialFit()
+}
+
 function stepAnim(): void {
   animRaf = 0
   let busy = false
@@ -227,6 +300,8 @@ const itemBorders = computed(() =>
 function zoomAround(nextZoom: number, anchorSec: number): void {
   const clamped = Math.min(maxZoom.value, Math.max(1, nextZoom))
   if (clamped === zoom.value) return
+  // 走过这里就是用户的缩放意图，之后时长变化不再自动改视窗
+  userZoomed = true
   const width = stageW.value
   const anchorRatio = width > 0 && pxPerSec.value > 0 ? (anchorSec - viewStartSec.value) / visibleSec.value : 0
   zoom.value = clamped
@@ -244,6 +319,7 @@ function zoomAround(nextZoom: number, anchorSec: number): void {
 function resetZoom(): void {
   zoom.value = 1
   zoomGoal = 1
+  userZoomed = true
   jumpTo(0)
 }
 
@@ -545,6 +621,9 @@ function startScrub(event: PointerEvent): void {
   // 永远不会触发。这跟「拖整条字幕条」那条坑是同一个机制（那边也是不能 preventDefault，
   // 否则「点一下选中」失效），所以两处都只 stopPropagation。
   event.stopPropagation()
+  // 拖游标也解开跟随：他正捏着游标，画面不该自己往左滑
+  followOn = false
+  userZoomed = true
   scrubPointer = event.pointerId
   editor.scrubbing = true
   ;(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId)
@@ -611,6 +690,9 @@ function onStagePointerMove(event: PointerEvent): void {
     if (Math.abs(dx) < PAN_THRESHOLD) return
     panState.moved = true
     panning.value = true
+    // 手动拖时间轴 = 用户想去别处看看，先解开播放跟随，别跟他抢画面
+    followOn = false
+    userZoomed = true
     // 一开始按下的那次定位作废：用户是在拖时间轴，不是在挑位置
     editor.setPlayhead(panState.playheadBefore)
   }
@@ -701,6 +783,9 @@ function onWheel(event: WheelEvent): void {
   // 横向滚轮优先用 deltaX；只有纵向滚轮时把它当横向用
   const raw = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY
   const pixels = event.deltaMode === 1 ? raw * 16 : raw
+  // 滚轮平移也是「我要去别处看看」：解开取景跟随，别在下一帧把画面拽回来
+  followOn = false
+  userZoomed = true
   panGoalSec += pixels / pxPerSec.value
   clampPanGoal()
   startAnim()
@@ -863,7 +948,7 @@ watch(
       mockPeaks.value = null
     }
     if (fileId && file && !file.merged) void project.ensureMedia(fileId)
-    resetZoom()
+    resetViewToFit()
     editor.setPlayhead(0)
     scheduleDraw()
   },
@@ -942,15 +1027,133 @@ watch(
   },
 )
 
-/** 播放时视窗跟着走，否则放大以后播到后面就看不见了 */
+/**
+ * 播放时视窗的走法：**换页**，不是被游标推着走。
+ *
+ * 用户要的观感是「纸带抽一下」：游标走到视窗右侧 86% 处，画面一次性左移，
+ * 让游标回到左侧 15% 的位置，然后停住让游标继续往右走。以前的写法是游标
+ * 钉在 86% 不动、波形匀速左移 —— 那是「游标推着波形走」，画面一刻不停，
+ * 看不到停顿，也就没有节奏。
+ *
+ * 换页复用同一条平滑动画（`stepAnim` 指数逼近），但一次位移跨 71% 视窗，
+ * 观感是「唰」的一下到位，不是持续蠕动。
+ *
+ * **阈值**：换页位移小于 `FOLLOW_MIN_JUMP_SEC` 秒时退回连续跟随。视窗只有
+ * 几秒宽的时候（放大到词的级别），每 0.3 秒抽一次会让人晕，细调时反而需要
+ * 画面稳定。
+ *
+ * `followOn` 是闩：只在游标越过右缘那一刻拉起，手动平移视窗 / 拖游标会解开
+ * （见 `onStagePointerMove` / `startScrub` / 滚轮平移）。没有它的话，用户想
+ * 看右边的画面会被下一次换页立刻拽回去。
+ */
+const FOLLOW_EDGE = 0.86
+/** 换页后游标停靠的位置（视窗宽度的 15%） */
+const FOLLOW_RETURN = 0.15
+/** 换页位移小于这个秒数就退回连续跟随 */
+const FOLLOW_MIN_JUMP_SEC = 3
+let followOn = false
+
 watch(
   () => editor.playheadSec,
   (t) => {
-    if (!editor.isPlaying || zoom.value <= 1) return
+    if (!editor.isPlaying || zoom.value <= 1) {
+      followOn = false
+      return
+    }
     const span = visibleSec.value
-    if (t >= viewStartSec.value && t <= viewStartSec.value + span * 0.9) return
-    jumpTo(t - span * 0.2)
+    if (!followOn) {
+      // 还没到右缘：让游标自己走，画面不动
+      if (t <= viewStartSec.value + span * FOLLOW_EDGE) return
+      followOn = true
+    }
+    const jump = span * (FOLLOW_EDGE - FOLLOW_RETURN)
+    // 只写目标值：这一帧不挪画面，交给 stepAnim 平滑追过去
+    panGoalSec = t - span * (jump >= FOLLOW_MIN_JUMP_SEC ? FOLLOW_RETURN : FOLLOW_EDGE)
+    clampPanGoal()
+    startAnim()
   },
+)
+
+/**
+ * 每个项目各自的「看到哪儿」：缩放倍数、视窗左边缘、播放头。
+ *
+ * 不记的症状很具体：在项目一里放大到 4 倍去看某个词的断句，切去项目二对照，
+ * 回来时视窗还停在项目一那个位置；而两份工程的时长不同，那个位置往往已经是
+ * 空白，整块波形看着像坏了。
+ *
+ * 为什么**连续写**而不是「切换时写一次」：
+ *   ① 切到没有内容的项目时整个编辑区会被换成空态，本组件直接卸载 —— 卸载之后
+ *      再进来的 watcher 不会执行，「切走那一刻记一笔」这一笔就永远丢了。
+ *   ② 放大、平移、拖播放头都是独立的动作，随时可能被打断（切页、关窗），
+ *      与其挑一个「大概都会经过」的时机，不如每次变了就记。
+ * 写的是 `boundDraftId` 而不是 `project.activeDraftId`：切换那一瞬间这两个
+ * 已经不是同一个了，按后者写会把上一份的视图记到新项目头上。
+ */
+let boundDraftId = project.activeDraftId
+
+function persistTimelineView(): void {
+  if (!boundDraftId) return
+  project.rememberTimelineView(boundDraftId, {
+    zoom: zoom.value,
+    startSec: viewStartSec.value,
+    playheadSec: editor.playheadSec,
+  })
+}
+
+watch([zoom, viewStartSec, () => editor.playheadSec], persistTimelineView)
+
+/** 把记忆摆到界面上（夹取按**当前**工程的时长算） */
+async function applyTimelineView(id: string): Promise<void> {
+  const mem = project.timelineViewOf(id)
+  await nextTick()
+  if (mem.zoom <= 0) {
+    // 这个项目还没被摆过：不硬编「适应宽度」，按总长给一个能看清字幕的视窗
+    autoFitPending = true
+    userZoomed = false
+    applyInitialFit()
+    // 没摆过的项目一律从头看：上一条音频的播放头位置对它没有意义
+    editor.setPlayhead(0)
+    return
+  }
+  autoFitPending = false
+  // 记过视窗 = 用户自己调过，别再按总长替他重摆
+  userZoomed = true
+  const z = Math.min(maxZoom.value, Math.max(1, mem.zoom))
+  zoom.value = z
+  zoomGoal = z
+  viewStartSec.value = mem.startSec
+  panGoalSec = mem.startSec
+  clampView()
+  clampPanGoal()
+  editor.setPlayhead(Math.min(mem.playheadSec, Math.max(0, duration.value)))
+  scheduleDraw()
+}
+
+watch(duration, () => {
+  if (autoFitPending || !userZoomed) applyInitialFit()
+})
+
+/*
+ * 挂载即按记忆摆位。
+ *
+ * 不能只在「切项目」时做：切到一个空项目再切回来，本组件是**重新挂载**的，
+ * 全新实例的 `zoom` 从 1 开始，而它的切换 watcher（`prev === id`）这一轮什么
+ * 都不会做 —— 不做这一步，切回来永远是「适应宽度 + 播放头在最左」。
+ */
+onMounted(() => {
+  boundDraftId = project.activeDraftId
+  void applyTimelineView(project.activeDraftId)
+})
+
+watch(
+  () => project.activeDraftId,
+  async (id) => {
+    // 先把上一份存下来（此刻 boundDraftId 还是旧的）
+    persistTimelineView()
+    boundDraftId = id
+    await applyTimelineView(id)
+  },
+  { flush: 'post' },
 )
 
 /** 拖拽中的预览也走全局监听：指针可能被 SetPointerCapture 绑到热区上 */

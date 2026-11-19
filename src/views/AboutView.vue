@@ -80,6 +80,11 @@ const LIBS = [
   // 与「用户自行获取的识别模型」不是一回事，必须单独列出来。
   { name: 'pyannote 声纹切分模型', license: 'MIT License' },
   { name: '3D-Speaker CAM++ 声纹模型', license: 'Apache License 2.0' },
+  // 断句词表的数据来源。不是代码组件，但词条随产物分发，按 MIT 的要求署名
+  { name: 'jieba 分词词典（断句词表）', license: 'MIT License' },
+  // 两个查表文件。同上：不是代码组件，但字表来自第三方，按许可署名
+  { name: 'OpenCC 繁简字表（TSCharacters）', license: 'Apache License 2.0' },
+  { name: 'Unihan / pinyin-data 拼音表', license: 'MIT License / Unicode License v3' },
   { name: '思源黑体（内嵌 Noto Sans SC 子集）', license: 'SIL Open Font License 1.1' },
   // 以下三个是识别模型，**不随安装包分发**，由使用者自行获取。列在这里是因为
   // 它们的许可各不相同，用户下载时用得上；权利归各自发布者，不在本软件范围内。
@@ -236,9 +241,11 @@ const LIBS = [
             </ul>
 
             <p class="licenses__note">
-              不含需付费授权的组件，只内置可自由分发的开源解码实现
+              不含需付费授权的组件，自带解码器只覆盖可自由分发的开源实现
               （WAV、AIFF、MP3、FLAC、OGG Vorbis、Opus）。
-              AAC、WMA、AMR、DTS 的部分专利仍在保护期内，未内置解码器，请先转换为上列任一格式。
+              M4A、MP4、MOV、MKV 等容器里的音轨由 Windows 自带的解码器完成，
+              本软件不含这些编码的实现代码，视频轨也不解码；
+              WMA、AMR、DTS 尚未支持，请先转换为上列任一格式。
             </p>
 
             <button class="btn btn--sm licenses__open" type="button" @click="openLicenses">

@@ -249,10 +249,11 @@ async function onUpdateClick(): Promise<void> {
   color: var(--color-accent-text);
 }
 
+/* 底栏与上面的导航列表之间不画分割线：两者本来就在同一块面板里，
+ * 一条横贯全宽的线只把「五个入口 + 开关」切成了两半，没有分区含义。 */
 .sidebar__foot {
   flex: none;
   padding: var(--space-3) var(--space-4);
-  border-top: 1px solid var(--color-border-subtle);
   transition: padding var(--dur-base) var(--ease-out);
 }
 
@@ -313,6 +314,20 @@ async function onUpdateClick(): Promise<void> {
 }
 
 .sidebar__version {
+  /*
+   * 光学对齐，不是几何对齐。
+   *
+   * `align-items: center` 居中的是**行盒**（16.5px），而 "v1.3.2" 里只有数字与
+   * 一个小写 v —— 没有下伸部，墨迹全压在基线上方，墨迹中心天生比行盒中心低
+   * 约 0.5px。旁边那个箭头是居中的 13px 图标，两者于是差半格：正常看不太出来，
+   * 放大截图就很明显（用户就是这么发现的）。
+   * 量过（4 倍图设备像素）：箭头墨迹中心 53.5，文字 55.5。
+   * 补 -0.5px 让两者重合；别改成动字号或行高，那会牵动别的排版。
+   */
+  position: relative;
+  /* 用 transform 而不是 top：top 会走布局、被吸附到整像素，-0.5 实际挪了 1px，
+     反而从「低半格」变成「高半格」；transform 在合成阶段生效，留得住半像素。 */
+  transform: translateY(-0.5px);
   white-space: nowrap;
   overflow: hidden;
   max-width: 140px;
@@ -385,7 +400,13 @@ async function onUpdateClick(): Promise<void> {
   opacity: 0;
 }
 
+/*
+ * 收起后按钮里只剩图标，文字是「max-width 归零」而不是移除 ——
+ * 它仍占掉一个 gap，于是 justify-content: center 居中的是「图标 + 间隙」这一坨，
+ * 图标本身偏左半个 gap。gap 必须同时归零，图标才落在 52px 栏的正中。
+ */
 .sidebar.is-collapsed .sidebar__update {
+  gap: 0;
   padding: 6px 0;
 }
 
@@ -393,7 +414,14 @@ async function onUpdateClick(): Promise<void> {
   padding: var(--space-3) var(--space-2);
 }
 
+/*
+ * 收起后这一行只剩开关本身（版本号 max-width 归零、不可见）。
+ * 必须居中：`.sidebar__meta` 是 flex 行，默认从左排 —— 22px 的按钮落在
+ * 52px 栏里会偏左 7px，和上面那列居中的导航图标对不上，看着像没对齐的意外。
+ * gap 同时归零：零宽度的版本号仍会占掉一个间隙，居中的是「按钮 + 间隙」这一坨。
+ */
 .sidebar.is-collapsed .sidebar__meta {
-  gap: var(--space-1);
+  gap: 0;
+  justify-content: center;
 }
 </style>

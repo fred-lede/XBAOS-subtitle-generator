@@ -13,6 +13,7 @@
  */
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useSettingsStore } from '@/stores/settings'
+import { useNativeChrome } from '@/composables/useNativeChrome'
 import type { AssistReviewPayload, AssistReviewTarget } from '@/types/engine'
 import type { SubtitleSegment } from '@/types'
 import {
@@ -815,6 +816,8 @@ function windowControl(action: 'minimize' | 'maximize' | 'close'): void {
   if (action === 'close') window.close()
 }
 
+const { nativeChrome } = useNativeChrome()
+
 const isMaximized = ref(false)
 let offState: (() => void) | undefined
 let offRefresh: (() => void) | undefined
@@ -883,22 +886,25 @@ onBeforeUnmount(() => {
           <span class="abar__pin-label">{{ onTop ? '已置顶' : '置顶' }}</span>
         </button>
 
-        <span class="abar__sep" aria-hidden="true" />
+        <!-- Windows 上这三个按钮由系统画，才有原生的贴靠布局 -->
+        <template v-if="!nativeChrome">
+          <span class="abar__sep" aria-hidden="true" />
 
-        <button class="abar__icon" type="button" title="最小化" @click="windowControl('minimize')">
-          <Icon name="window-min" :size="15" />
-        </button>
-        <button
-          class="abar__icon"
-          type="button"
-          :title="isMaximized ? '还原' : '最大化'"
-          @click="windowControl('maximize')"
-        >
-          <Icon :name="isMaximized ? 'window-restore' : 'window-max'" :size="15" />
-        </button>
-        <button class="abar__icon abar__icon--close" type="button" title="关闭" @click="windowControl('close')">
-          <Icon name="x" :size="15" />
-        </button>
+          <button class="abar__icon" type="button" title="最小化" @click="windowControl('minimize')">
+            <Icon name="window-min" :size="15" />
+          </button>
+          <button
+            class="abar__icon"
+            type="button"
+            :title="isMaximized ? '还原' : '最大化'"
+            @click="windowControl('maximize')"
+          >
+            <Icon :name="isMaximized ? 'window-restore' : 'window-max'" :size="15" />
+          </button>
+          <button class="abar__icon abar__icon--close" type="button" title="关闭" @click="windowControl('close')">
+            <Icon name="x" :size="15" />
+          </button>
+        </template>
       </div>
     </header>
 
@@ -1521,6 +1527,8 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   height: 100%;
+  /* 给系统按钮让位；没有 overlay 时 env 回落 100vw，减出来正好是 0 */
+  margin-right: calc(100vw - env(titlebar-area-width, 100vw));
 }
 
 .abar__btn,
@@ -1762,6 +1770,7 @@ onBeforeUnmount(() => {
   gap: 2px;
   max-height: 200px;
   overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 
 .pick__row {
@@ -1868,6 +1877,7 @@ onBeforeUnmount(() => {
   /* 一个文件几百条时不能把整个区块撑开 */
   max-height: 260px;
   overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 
 .cue {
@@ -2096,6 +2106,7 @@ onBeforeUnmount(() => {
   padding: var(--space-3);
   max-height: 320px;
   overflow: auto;
+  scrollbar-gutter: stable;
   background: var(--color-bg-surface);
   font-family: var(--font-mono);
   font-size: 12px;
@@ -2221,6 +2232,7 @@ onBeforeUnmount(() => {
   gap: var(--space-2);
   max-height: 300px;
   overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 
 .diff {

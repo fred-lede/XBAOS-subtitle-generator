@@ -101,6 +101,19 @@ contextBridge.exposeInMainWorld('xbaos', {
   // ---- 窗口控制
   window: {
     control: (action) => ipcRenderer.send('window:control', action),
+    /**
+     * 标题栏的窗口按钮是不是系统画的。
+     *
+     * Windows 上为 `true`（Window Controls Overlay）：界面不该再自绘那三个按钮，
+     * 还要给系统按钮留出 `env(titlebar-area-width)` 之外的位置。离开 Windows
+     * 或浏览器预览时为 `false`，界面按自绘处理。
+     */
+    nativeChrome: process.platform === 'win32',
+    /**
+     * 系统按钮的符号色。系统不认识页面的 CSS 变量，主题一变就得把算好的颜色
+     * 报上去；按钮底色恒为透明，由页面与毛玻璃材质透上来。
+     */
+    setOverlay: (colors) => ipcRenderer.send('window:overlay', colors),
     onStateChange: (cb) => subscribe('window:state', cb),
   },
 
@@ -126,6 +139,13 @@ contextBridge.exposeInMainWorld('xbaos', {
     confirmOption: (options) => ipcRenderer.invoke('dialog:confirm-option', options),
   },
 
+  // ---- 媒体：取一份 Chromium 能播的音频
+  // 包内 ffmpeg 是非专有构建，解不了 AAC；m4a / mp4 / aac 要先转成 WAV 缓存，
+  // 否则试听没声音、波形也是空的。其余格式返回 path:null，渲染层直接读源文件。
+  media: {
+    playable: (p, ext) => ipcRenderer.invoke('media:playable', p, ext),
+  },
+
   // ---- 文件系统（受限：只暴露这几个操作）
   fs: {
     exists: (p) => ipcRenderer.invoke('fs:exists', p),
@@ -134,6 +154,10 @@ contextBridge.exposeInMainWorld('xbaos', {
     /** 编码自适应读取（BOM / UTF-8 / GBK），返回 { text, encoding } */
     readTextAuto: (p) => ipcRenderer.invoke('fs:readTextAuto', p),
     readArrayBuffer: (p) => ipcRenderer.invoke('fs:readArrayBuffer', p),
+    /** 导出音频的中间段：字节交给主进程落到系统临时目录，返回临时文件路径 */
+    writeAudioChunk: (bytes, seq) => ipcRenderer.invoke('audio:writeChunk', bytes, seq),
+    /** 按顺序拼接若干 WAV：校验规格一致后追加 data 段，收尾会删掉中间文件 */
+    concatWav: (parts, outPath) => ipcRenderer.invoke('audio:concatWav', parts, outPath),
     writeText: (p, content) => ipcRenderer.invoke('fs:writeText', p, content),
     writeSubtitle: (p, content, encoding) =>
       ipcRenderer.invoke('fs:writeSubtitle', p, content, encoding),
@@ -141,6 +165,13 @@ contextBridge.exposeInMainWorld('xbaos', {
     openPath: (p) => ipcRenderer.invoke('fs:openPath', p),
     basename: (p) => ipcRenderer.invoke('fs:basename', p),
     dirname: (p) => ipcRenderer.invoke('fs:dirname', p),
+  },
+
+  // ---- 自动草稿（防丢）：未保存的工程定期落盘，下次启动恢复
+  autosave: {
+    peek: () => ipcRenderer.invoke('autosave:peek'),
+    write: (text) => ipcRenderer.invoke('autosave:write', text),
+    clear: () => ipcRenderer.invoke('autosave:clear'),
   },
 
   // ---- 项目文件（.xbsgp）

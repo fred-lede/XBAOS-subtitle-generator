@@ -3107,6 +3107,39 @@ const scenarios = {
     })()`)
     check('分段控件选中标记滑动到了新的一格', thumb?.onActive === true, JSON.stringify(thumb))
 
+    /*
+     * 折叠再恢复（= 切走页面 / 最小化窗口时发生的事）。
+     *
+     * 容器一旦不在布局里，选中项与容器的 rect 都是 0，差值也是 0 —— 旧实现照旧写
+     * `left:0; top:0`，等页面回来 CSS 过渡就从那里滑过去，用户看到的是「一块底色
+     * 从左上角飞出来」。这里守两件事：折叠期间坐标不许被改写、恢复后必须仍贴着选中格。
+     */
+    const collapse = await cdp.evaluate(`(async () => {
+      const seg = document.querySelector('.seg')
+      const thumb = seg?.querySelector('.seg-thumb')
+      if (!seg || !thumb) return null
+      const before = thumb.style.left
+      seg.style.display = 'none'
+      await new Promise((r) => setTimeout(r, 120))
+      const hiddenLeft = thumb.style.left
+      const hiddenOpacity = thumb.style.opacity
+      seg.style.display = ''
+      await new Promise((r) => setTimeout(r, 160))
+      const active = seg.querySelector('.choice.is-active')
+      const t = thumb.getBoundingClientRect()
+      const a = active.getBoundingClientRect()
+      return {
+        before,
+        hiddenLeft,
+        kept: before !== '' && hiddenLeft === before,
+        hiddenOpacity,
+        backOpacity: thumb.style.opacity,
+        onActive: Math.abs(t.left - a.left) < 2 && Math.abs(t.width - a.width) < 2,
+      }
+    })()`)
+    check('折叠期间不把指示块改写到 (0,0)', collapse?.kept === true, JSON.stringify(collapse))
+    check('恢复后指示块仍贴着选中格', collapse?.onActive === true, JSON.stringify(collapse))
+
     const hint = await cdp.evaluate(`(() => {
       const blocks = [...document.querySelectorAll('.field__hint')]
       const el = blocks.find((b) => b.textContent.includes('五遍') || b.textContent.includes('两遍精选'))
@@ -3777,9 +3810,8 @@ const scenarios = {
     /**
      * 按文字点按钮。
      *
-     * `exact` 是必须的：底栏同时有「保存项目」和「保存」，模糊匹配会先命中
-     * 前者 —— 那样测的就不是「就地覆盖」了，而且会弹出一个保存对话框把
-     * 后面几步全带偏。
+     * `exact` 用于「文字是另一个按钮的前缀」的场合：底栏有「保存为项目文件」
+     * 这样的图标按钮，模糊匹配会先命中它而不是想点的那个。
      */
     const clickByText = async (selector, text, exact = false) => {
       const pos = await centerOf(
@@ -4081,24 +4113,19 @@ const scenarios = {
       )`,
     )
     check('底栏有保存项目的入口', hasProjectSave === true, String(hasProjectSave))
-    check('导出后底部出现「保存」按钮', labels.includes('保存'), labels.join(' / '))
-    check('「保存」排在「导出字幕」左侧', labels.indexOf('保存') < labels.indexOf('导出字幕'), labels.join(' / '))
-
-    // 保存必须写回上次导出的那个位置，而不是随手挑一个。
-    // 精确匹配「保存」：底栏还有「保存项目」，模糊匹配会点到它。
-    await clickByText('.editor__foot button', '保存', true)
-    await sleep(400)
-    const writes2 = await cdp.evaluate(`window.__writes`)
-    check(
-      '「保存」覆盖写回了上次导出的文件',
-      writes2.length === 2 && writes2[1]?.p === SRT_PATH,
-      String(writes2[1]?.p),
-    )
+    /*
+     * 2026-11-16 起底栏不再有第二个「保存」。
+     *
+     * 它做的是「覆盖写回上次导出的字幕文件」，与「导出字幕」只差一个落点，
+     * 用户看不出为什么要有两个按钮。现在底栏只有两件事：存工程、导出字幕。
+     */
+    check('导出后不再冒出第二个「保存」按钮', !labels.includes('保存'), labels.join(' / '))
+    check('底栏仍有「导出字幕」', labels.includes('导出字幕'), labels.join(' / '))
 
     /* ---- 关窗闸门（P0-1）
      *
-     * 「保存字幕」写的是字幕文件，不是工程（`.xbsgp`）。工程只活在内存里，
-     * 关窗就没了 —— 所以刚刚覆盖保存过字幕，关窗**仍然要问一句**。
+     * 导出的字幕写的是字幕文件，不是工程（`.xbsgp`）。工程只活在内存里，
+     * 关窗就没了 —— 所以刚刚导出过字幕，关窗**仍然要问一句**。
      * 桩回答「取消」，于是流程停在这里、不关窗。
      */
     const closeExported = await cdp.evaluate(`(async () => {
@@ -4364,19 +4391,15 @@ const scenarios = {
       JSON.stringify(recs),
     )
 
-    // 保存必须把**两个**文件都照原样重写，不能把英文那份改成中文
-    await cdp.evaluate(`(window.__writes = [], true)`)
-    // 精确匹配「保存」：底栏还有「保存项目」，模糊匹配会点到它
-    await clickByText('.editor__foot button', '保存', true)
-    await sleep(600)
-    const writes4 = await cdp.evaluate(`window.__writes`)
-    check('「保存」把两个文件都写回去了', writes4.length === 2, `写入 ${writes4.length} 次`)
-    const enBack = writes4.find((w) => String(w.p).endsWith('.en.srt'))
-    check(
-      '保存保留双语形态：英文文件写回去还是英文',
-      !!enBack && enBack.content.includes('First probe line') && !enBack.content.includes('第一句探针字幕'),
-      JSON.stringify(enBack?.content ?? null),
-    )
+    /*
+     * 2026-11-16 起没有「就地保存」这一步。
+     *
+     * 它做的是「把上次导出的文件原地重写一遍」，与「导出字幕」只差一个落点；
+     * 底栏留着两个长得一样的按钮，用户分不清哪个是存工程。现在导完就完事，
+     * 这里只守住「导出过之后底栏没有多出第二个按钮」。
+     */
+    const labels3 = await footLabels()
+    check('分别导出之后底栏也没有「保存」', !labels3.includes('保存'), labels3.join(' / '))
 
     // ---- 清空队列 → 落点释放、保存按钮隐藏 ----
     /*
@@ -6672,6 +6695,34 @@ const scenarios = {
       `还剩 ${ghostLeft} 个`,
     )
 
+    /* ---------------- 相邻接缝：只指下一条（区间左闭右开） ---------------- */
+
+    /*
+     * 两条首尾严丝合缝时（甲.end === 乙.start），旧写法 `t >= start && t <= end`
+     * 会让两条同时命中 —— 游标刚好停在接缝上，下面冒出两个三角，而此刻只可能
+     * 在听一条。改成左闭右开后，接缝归下一条。真正的重叠（不同泳道同时存在）
+     * 仍然两个三角，上一条判据守着那个行为。
+     */
+    await store(`
+      const f = project.viewFile
+      f.segments = [
+        ${JSON.stringify(mk('s1', 0, 4, '接缝前的那一条'))},
+        ${JSON.stringify(mk('s2', 4, 8, '接缝后的那一条'))},
+      ]
+      editor.setPlayhead(4)
+    `)
+    await waitFor(cdp, `document.querySelectorAll('.subtable__mark.is-ghost').length === 0`, 2000)
+    const seam = await cdp.evaluate(`(() => {
+      const ids = [...document.querySelectorAll('.subtable__mark:not(.is-ghost)')].map((m) => m.dataset.markId)
+      const marked = [...document.querySelectorAll('.row.is-marked')].map((r) => r.dataset.segId)
+      return { ids, marked }
+    })()`)
+    check(
+      '首尾相接处只指下一条（接缝归后一条）',
+      seam.ids.length === 1 && seam.ids[0] === 's2' && seam.marked.length === 1 && seam.marked[0] === 's2',
+      JSON.stringify(seam),
+    )
+
     /* ---------------- 底部告警分层：当前文件 vs 整个工程 ---------------- */
 
     await store(`
@@ -7010,6 +7061,54 @@ const scenarios = {
       )
       await shot(cdp, 'probe-sidebar-collapsed.png')
     }
+
+    /*
+     * 收起态的更新提示只剩一个图标，它必须落在 52px 栏的正中。
+     * `justify-content: center` 居中的是「图标 + gap + 零宽文字」这一坨 ——
+     * 文字的 max-width 归零了但仍占一个间隙，图标就偏左 4px。截图看不出来，只能量。
+     */
+    await goto(cdp, `${BASE}/?demo=1&view=editor&theme=light&update=available`)
+    await sleep(500)
+    const alreadyCollapsed = await cdp.evaluate(
+      `document.querySelector('.sidebar')?.classList.contains('is-collapsed') === true`,
+    )
+    if (!alreadyCollapsed) {
+      const t2 = await cdp.evaluate(`(() => {
+        const b = document.querySelector('.sidebar__collapse')
+        if (!b) return null
+        const r = b.getBoundingClientRect()
+        return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
+      })()`)
+      if (t2) {
+        await cdp.click(t2.x, t2.y)
+        await sleep(450)
+      }
+    }
+    const footBox = await cdp.evaluate(`(() => {
+      const nav = document.querySelector('.sidebar')
+      const btn = document.querySelector('.sidebar__update')
+      const foot = document.querySelector('.sidebar__foot')
+      if (!nav || !btn || !foot) return null
+      const nr = nav.getBoundingClientRect()
+      const icon = btn.querySelector('svg')
+      if (!icon) return null
+      const ir = icon.getBoundingClientRect()
+      return {
+        iconCenter: Math.round(ir.x + ir.width / 2),
+        axis: Math.round(nr.x + nr.width / 2),
+        borderTop: getComputedStyle(foot).borderTopWidth,
+      }
+    })()`)
+    check(
+      '收起时更新按钮的图标落在侧栏中轴上',
+      footBox !== null && Math.abs(footBox.iconCenter - footBox.axis) <= 1,
+      JSON.stringify(footBox),
+    )
+    check(
+      '侧栏底栏不画分割线',
+      footBox !== null && footBox.borderTop === '0px',
+      footBox ? footBox.borderTop : '没量到',
+    )
 
     await cdp.evaluate(`(() => {
       Object.keys(localStorage).filter((k) => k.startsWith('xbaos.settings')).forEach((k) => localStorage.removeItem(k))
@@ -7411,6 +7510,54 @@ const scenarios = {
 
     await run(`project.setBatchMode('separate')`)
   },
+
+  /*
+   * 通知圆点的「看过就消失」。
+   *
+   * store 层的判据（最新 id ≠ 已读 id）在 unit 里卡着，这里验的是**界面上真的
+   * 亮了又灭**：发两条 → 圆点在 → 展开面板 → 圆点没了 → 再来一条 → 又亮。
+   */
+  async 'notice-dot'(cdp) {
+    await goto(cdp, BASE + '/?demo=1&view=editor')
+    await sleep(400)
+    const useUi = (body) =>
+      cdp.evaluate(`(async () => {
+        const s = document.querySelector('#app').__vue_app__.config.globalProperties.$pinia._s.get('ui')
+        if (!s) throw new Error('拿不到 ui store')
+        ${body}
+      })()`)
+
+    await useUi(`s.notify('info', '探针通知一'); s.notify('info', '探针通知二'); return true`)
+    await sleep(200)
+    const dotAfterNotify = await cdp.evaluate(`!!document.querySelector('.notice__dot')`)
+
+    const bell = await cdp.evaluate(`(() => {
+      const r = document.querySelector('.notice__btn').getBoundingClientRect()
+      return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
+    })()`)
+    await cdp.click(bell.x, bell.y)
+    await sleep(250)
+    const afterOpen = await cdp.evaluate(`(() => ({
+      dot: !!document.querySelector('.notice__dot'),
+      items: document.querySelectorAll('.notice__item').length,
+      open: !!document.querySelector('.notice__panel'),
+    }))()`)
+
+    // 面板还开着的时候再来一条：也要重新亮起来
+    await useUi(`s.notify('error', '探针通知三'); return true`)
+    await sleep(200)
+    const dotAfterNew = await cdp.evaluate(`!!document.querySelector('.notice__dot')`)
+
+    check('来了新通知就点圆点', dotAfterNotify === true, `圆点 ${dotAfterNotify}`)
+    check(
+      '展开通知中心后圆点消失，且面板里能看到这两条',
+      afterOpen.open === true && afterOpen.dot === false && afterOpen.items >= 2,
+      JSON.stringify(afterOpen),
+    )
+    check('再来一条又亮起', dotAfterNew === true, `圆点 ${dotAfterNew}`)
+    await shot(cdp, 'notice-center.png')
+  },
+
 }
 
 /* ---------------------------------------------------------------------- main */

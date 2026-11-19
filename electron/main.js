@@ -19,6 +19,8 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 
 import { EngineClient, EngineCanceledError, EngineCrashError } from './engine-client.js'
+import { PlayableCache, needsSystemDecoder } from './media-cache.js'
+import { concatWav } from './wav-export.js'
 import { decodeTextAuto, encodeSubtitle } from './encoding.js'
 import {
   PROJECT_EXT,
@@ -179,6 +181,30 @@ function engineInfo(arch = ARCH_WHISPER) {
     arch,
   })
   return { exe, source }
+}
+
+/**
+ * 「可播放音频」缓存（m4a / mp4 / aac 靠它才能试听与画波形）。
+ *
+ * 懒建：`app.getPath('userData')` 在模块加载阶段还不一定稳（用户可能用
+ * `--user-data-dir` 覆盖过），第一次真正用到时再算。
+ * 引擎路径每次现取 —— 用户可能刚切换模型架构，换来了另一个引擎。
+ */
+let playableCache = null
+function getPlayableCache() {
+  if (!playableCache) {
+    playableCache = new PlayableCache({
+      cacheDir: path.join(app.getPath('userData'), 'media-cache'),
+      engineExe: () => {
+        for (const arch of [ARCH_SHERPA, ARCH_WHISPER]) {
+          const { exe } = engineInfo(arch)
+          if (exe) return exe
+        }
+        return ''
+      },
+    })
+  }
+  return playableCache
 }
 
 /**
@@ -740,6 +766,42 @@ function glassWindowOptions(headless) {
   }
 }
 
+/*
+ * 窗口按钮交给系统画。
+ *
+ * 自绘三个按钮看着能做得更齐，代价是 Windows 11 的贴靠布局（悬停最大化弹出
+ * 六宫格）永远不出现 —— 那个浮窗是系统给**它自己的**标题栏按钮画的，
+ * HTML 画出来的按钮系统不认，位置也不会替我们算。改用 Window Controls
+ * Overlay 把按钮还回去之后，浮窗、悬停高亮、双击最大化都是原生行为。
+ *
+ * `color` 给全透明：按钮区的底色由页面（含毛玻璃材质）透上来，系统只负责
+ * 符号与悬停状态；`symbolColor` 只有一个值，随主题走，由渲染层报上来。
+ */
+const NATIVE_WINDOW_CONTROLS = process.platform === 'win32'
+/** 必须与 CSS 的 `--titlebar-height` 一致（三个窗口的标题栏都是这一档） */
+const TITLEBAR_HEIGHT = 40
+/**
+ * 按钮区不画底色（全透明），让页面底色与毛玻璃材质直接透上来。
+ *
+ * 曾为「左上角偶发一块白」改成过不透明同色，代价是按钮区变成一块实心色块 ——
+ * 毛玻璃下它与半透明标题栏的色差一眼可见，比那个偶发白块更难看，已回退。
+ */
+const TITLEBAR_GLASS = '#00000000'
+
+function nativeChromeOptions(theme) {
+  if (!NATIVE_WINDOW_CONTROLS) return { frame: false }
+  const dark = theme === 'dark'
+  return {
+    // 注意：不要同时写 `frame: false`。Windows 上这两者一起用会让系统按钮不出现
+    titleBarStyle: 'hidden',
+    titleBarOverlay: {
+      color: TITLEBAR_GLASS,
+      symbolColor: dark ? '#e6e6e6' : '#1f1f1f',
+      height: TITLEBAR_HEIGHT,
+    },
+  }
+}
+
 /** 三个窗口一起切材质。窗口可能还没建、可能已销毁，逐个判掉 */
 function applyGlassMaterial(active) {
   for (const win of [mainWindow, assistWindow, recordWindow]) {
@@ -808,8 +870,8 @@ function createWindow() {
     // 最小尺寸也不能超过屏幕可用高度，否则小屏上窗口永远塞不进工作区
     minWidth: Math.min(1040, width),
     minHeight: Math.min(680, height),
-    // 界面自带标题栏，用系统边框会重复一条
-    frame: false,
+    // 界面自带标题栏，用系统边框会重复一条。Windows 上改为把三个按钮交回系统
+    ...nativeChromeOptions(startupTheme),
     // 开发模式的窗口/任务栏图标。打包后 build/ 不进 asar，
     // Windows 会自动取 exe 里嵌的图标资源，无需指定
     ...(app.isPackaged ? {} : { icon: path.join(repoRoot, 'build', 'icon.ico') }),
@@ -1004,8 +1066,8 @@ function createAssistWindow(payload) {
     // 可缩放：提示词长短不一，用户会想把它拉大一点看
     resizable: true,
     maximizable: true,
-    // 与主窗口一致的自绘标题栏
-    frame: false,
+    // 与主窗口一致：Windows 上三个按钮由系统画，贴靠布局才是原生的
+    ...nativeChromeOptions(resolvedStartupTheme()),
     // 不默认置顶：两个窗口来回切是这段流程的常态，长期钉在最前反而挡住别的窗口
     alwaysOnTop: false,
     ...(app.isPackaged ? {} : { icon: path.join(repoRoot, 'build', 'icon.ico') }),
@@ -1092,7 +1154,7 @@ function createRecordWindow() {
     minHeight: 480,
     resizable: true,
     maximizable: true,
-    frame: false,
+    ...nativeChromeOptions(resolvedStartupTheme()),
     alwaysOnTop: false,
     ...(app.isPackaged ? {} : { icon: path.join(repoRoot, 'build', 'icon.ico') }),
     backgroundColor: glass.active ? '#00000000' : glass.solidBg,
@@ -1388,18 +1450,59 @@ function registerIpc() {
     } else if (action === 'close') win.close()
   })
 
+  /*
+   * 系统按钮的颜色跟着主题走。
+   *
+   * 按钮底色恒为全透明（材质与页面底色透上来本身就是对的），只有符号色要在
+   * 深浅两套之间切 —— 系统按钮不认识我们的 CSS 变量，只能由渲染层读完计算样式
+   * 后报上来。`height` 每次一并给：Windows 要求三个字段同时传。
+   */
+  ipcMain.on('window:overlay', (event, colors) => {
+    if (!NATIVE_WINDOW_CONTROLS) return
+    const win = BrowserWindow.fromWebContents(event.sender)
+    if (!win || win.isDestroyed()) return
+    const symbolColor = typeof colors?.symbolColor === 'string' ? colors.symbolColor : '#e6e6e6'
+    try {
+      win.setTitleBarOverlay({ color: TITLEBAR_GLASS, symbolColor, height: TITLEBAR_HEIGHT })
+    } catch {
+      // 没有 overlay 的窗口（例如非 Windows）上调用会抛错：忽略即可
+    }
+  })
+
   // ---- 系统对话框
   ipcMain.handle('dialog:pickAudio', async () => {
     if (!mainWindow) return []
     const result = await dialog.showOpenDialog(mainWindow, {
-      title: '选择音频文件',
+      title: '选择音频或视频文件',
       properties: ['openFile', 'multiSelections'],
       filters: [
-        { name: '音频文件', extensions: ['wav', 'mp3', 'flac', 'ogg', 'opus'] },
+        {
+          name: '音频与视频文件',
+          extensions: [
+            'wav',
+            'mp3',
+            'flac',
+            'ogg',
+            'oga',
+            'opus',
+            'aif',
+            'aiff',
+            'm4a',
+            'm4b',
+            'aac',
+            'mp4',
+            'm4v',
+            'mov',
+            'mkv',
+          ],
+        },
         { name: 'WAV', extensions: ['wav'] },
         { name: 'MP3', extensions: ['mp3'] },
         { name: 'FLAC', extensions: ['flac'] },
-        { name: 'OGG / Opus', extensions: ['ogg', 'opus'] },
+        { name: 'OGG / Opus', extensions: ['ogg', 'oga', 'opus'] },
+        // 下面两组走 Windows 系统解码器，单独列出来好让用户认出来
+        { name: 'M4A / MP4 / AAC', extensions: ['m4a', 'm4b', 'aac', 'mp4', 'm4v'] },
+        { name: '视频文件（只取音轨）', extensions: ['mp4', 'm4v', 'mov', 'mkv'] },
         { name: '全部文件', extensions: ['*'] },
       ],
     })
@@ -1532,6 +1635,22 @@ function registerIpc() {
   })
 
   /**
+   * 取一份「Chromium 能播」的音频。
+   *
+   * 包内的 ffmpeg.dll 是非专有构建，解不了 AAC，而试听与波形都走 Chromium 的
+   * 解码链路 —— 所以 m4a / mp4 / aac 这类格式要先由引擎（经系统解码器）解成
+   * WAV 缓存。其余格式原样返回 `path: null`，渲染层继续读源文件，
+   * 不为了「统一」把所有文件都多转一遍。
+   */
+  ipcMain.handle('media:playable', async (_event, srcPath, ext) => {
+    if (typeof srcPath !== 'string' || !srcPath) {
+      return { ok: false, message: '没有音频路径' }
+    }
+    if (!needsSystemDecoder(ext)) return { ok: true, path: null, cached: false }
+    return getPlayableCache().ensure(srcPath)
+  })
+
+  /**
    * 写字幕文件，带编码选择。目录不存在就建，避免用户手填了一个
    * 还不存在的路径时直接失败。返回真实写入的路径。
    *
@@ -1550,6 +1669,73 @@ function registerIpc() {
     await fs.mkdir(dir, { recursive: true })
     await fs.writeFile(target, content, { encoding: 'utf8' })
     return target
+  })
+
+  /**
+   * 导出音频的中间段。
+   *
+   * 渲染层逐段解码后把 WAV 字节交过来，这里落到系统临时目录。不让渲染层
+   * 自己拼临时路径，是因为它拿不到 `app.getPath('temp')`，硬拼 `%TEMP%`
+   * 在改过环境变量的机器上会写到一个不存在的位置。
+   *
+   * 中间文件由 `audio:concatWav` 收尾时删掉，渲染层不用管。
+   */
+  ipcMain.handle('audio:writeChunk', async (_event, bytes, seq) => {
+    const dir = path.join(app.getPath('temp'), 'xbaos-audio-export')
+    await fs.mkdir(dir, { recursive: true })
+    const target = path.join(dir, `chunk-${String(seq).padStart(4, '0')}.wav`)
+    await fs.writeFile(target, Buffer.from(bytes))
+    return target
+  })
+
+  /**
+   * 按顺序拼接 WAV。
+   *
+   * 规格校验（采样率 / 声道 / 位深必须一致）放在主进程：渲染层虽然负责把每段
+   * 都解成同一规格，但漏一段就会拼出一份时快时慢的音频，这里挡一道更省事。
+   * 无论成败都清掉中间文件 —— 一小时 48kHz 立体声有 690MB，留着就是垃圾。
+   */
+  ipcMain.handle('audio:concatWav', async (_event, parts, outPath) => {
+    try {
+      return concatWav(parts, outPath)
+    } finally {
+      for (const p of parts) {
+        await fs.rm(p, { force: true }).catch(() => {})
+      }
+    }
+  })
+
+  /* ------------------------------------------------------ 自动草稿（防丢） */
+
+  /*
+   * 「识别完但还没保存，合盖睡眠，唤醒后界面重载，成果没了」。
+   *
+   * 渲染进程的状态只在内存里，系统挂起再恢复时 Electron 可能重建渲染进程。
+   * 补法只有一条：把工程定期写到磁盘。存在 userData 下而不是临时目录 ——
+   * 临时目录会被系统清理，而这正是要保命的东西。
+   */
+  const autosaveFile = () => path.join(app.getPath('userData'), 'autosave', 'draft.xbsgp')
+
+  ipcMain.handle('autosave:peek', async () => {
+    const target = autosaveFile()
+    try {
+      const st = await fs.stat(target)
+      return { exists: st.isFile() && st.size > 0, path: target, savedAt: st.mtimeMs }
+    } catch {
+      return { exists: false, path: target, savedAt: 0 }
+    }
+  })
+
+  ipcMain.handle('autosave:write', async (_event, text) => {
+    const target = autosaveFile()
+    await fs.mkdir(path.dirname(target), { recursive: true })
+    await fs.writeFile(target, text, 'utf8')
+    return true
+  })
+
+  ipcMain.handle('autosave:clear', async () => {
+    await fs.rm(autosaveFile(), { force: true }).catch(() => {})
+    return true
   })
 
   ipcMain.handle('fs:reveal', async (_event, target) => {

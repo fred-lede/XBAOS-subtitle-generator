@@ -51,6 +51,7 @@ import {
   speakerName,
 } from '../src/utils/speaker'
 import { buildWrapWords } from '../src/utils/wrapWords'
+import { WRAP_DICT_RAW } from '../src/data/wrapDict'
 import {
   defaultProjectName,
   isProjectPath,
@@ -1213,7 +1214,7 @@ const OPT: PunctuationOptions = { zh: 'strip-split', en: 'keep' }
     }),
   )
 
-  // 对照：不传词表时「不 / 把」被切开；传入词表后挪到「为什么」之后
+  // 对照：不传词表时按宽度均分；传入词表后切点必须避开词内部
   const hard = seg(0, 6, '那微软为什么不把错误的标准改过来呢')
   const plain = applyLineWrap([hard], SPEC)
   const smart = applyLineWrap([hard], { ...SPEC, wrapWords: words })
@@ -1222,21 +1223,35 @@ const OPT: PunctuationOptions = { zh: 'strip-split', en: 'keep' }
     plain.segments.map((s) => s.text).join('|') === '那微软为什么不把错|误的标准改过来呢',
     plain.segments.map((s) => s.text).join('|'),
   )
-  check(
-    '词表把切点拉回词边界',
-    smart.segments.map((s) => s.text).join('|') === '那微软为什么|不把错误的标准改过来呢',
-    smart.segments.map((s) => s.text).join('|'),
-  )
-  check('词表不增删任何一个字', smart.segments.map((s) => s.text).join('') === hard.text)
+  /*
+   * 判据改成「切点不落在任何已收录词内部」，不再锁死具体字符串。
+   *
+   * 2026-11-13 断点模型从「加权求和」换成「约束 + 字典序」之后，这条确实从
+   * 「那微软为什么|不把…」挪到了「…错误的|标准…」—— 两者都在词边界上，没有
+   * 谁对谁错；锁死字符串会让每次调参都变成一场无意义的改测试。
+   */
+  const insideKnownWord = (text: string, lines: string[]): string[] => {
+    const bad: string[] = []
+    let pos = 0
+    for (let i = 0; i < lines.length - 1; i += 1) {
+      pos += Array.from(lines[i]).length
+      for (const w of words) {
+        for (let at = Math.max(0, pos - w.length + 1); at < pos; at += 1) {
+          if (text.startsWith(w, at) && at + w.length > pos) bad.push(`${w}@${pos}`)
+        }
+      }
+    }
+    return bad
+  }
+  const smartLines = smart.segments.map((s) => s.text)
+  check('词表让切点避开所有已收录词的内部', insideKnownWord(hard.text, smartLines).length === 0, smartLines.join('|'))
+  check('词表不增删任何一个字', smartLines.join('') === hard.text)
   check('词表不改变条数', smart.segments.length === plain.segments.length)
 
   // 常见搭配同样不能被横切
   const equalCase = '很多人觉得打开这个模式就等于在互联网上穿上了隐身衣'
-  check(
-    '「等于」不被切开',
-    breakIntoLines(equalCase, 32, words).join('|') === '很多人觉得打开这个模式|就等于在互联网上穿上了隐身衣',
-    breakIntoLines(equalCase, 32, words).join('|'),
-  )
+  const equalLines = breakIntoLines(equalCase, 32, words)
+  check('「等于」不被切开', insideKnownWord(equalCase, equalLines).length === 0, equalLines.join('|'))
   const stdCase = '但问题就在于这套标准真的被全面执行了吗'
   check(
     '「标准」不被切开',
@@ -1262,6 +1277,48 @@ const OPT: PunctuationOptions = { zh: 'strip-split', en: 'keep' }
     noFrag.segments.every((s) => widthUnits(s.text) >= 12),
     JSON.stringify(noFrag.segments.map((s) => [s.text, widthUnits(s.text)])),
   )
+
+  /* ---- 2026-11-13：断点模型从「加权求和」换成「约束 + 字典序 + 全局最优」 ---- */
+  {
+    const src = readFileSync(new URL('../src/utils/lineWrap.ts', import.meta.url), 'utf8')
+    check(
+      '断点求解是整段动态规划，不是逐行贪心',
+      /function layoutLines/.test(src) && /Math\.ceil\(total \/ capacity\) \+ 1/.test(src) && /lessThan\(sum, cur\)/.test(src),
+      '贪心只对当前行最优，最后一行常常只剩三五个字 —— 尾巴就是这么被推出去的',
+    )
+    check(
+      '切进已收录词内部是硬约束而不是扣分',
+      /const C_IN_WORD = 0/.test(src) && /out\[C_IN_WORD\] = 1/.test(src) && !/score -=/.test(src),
+      '加权求和里 −8000 会被行首禁则的 −12000 盖过：为了避开「们」而切进另一个词',
+    )
+    check(
+      '只有两侧都有词才算词交界',
+      /mask\.endAt\.has\(j\)/.test(src) && /mask\.startAt\.has\(j\)/.test(src),
+      '「…专有 | 编解码器…」里「专有」在此结束，但右边的「编」只是未收录词的头半个字',
+    )
+    check(
+      '排版禁则：标点不落行首',
+      /NO_LINE_START_PUNCT/.test(src) && /NO_LINE_END_OPEN/.test(src),
+      '「…逐字降级 / 。界面图标…」把句号甩到下一行开头，一眼就是错的',
+    )
+
+    /*
+     * 短行门槛（0.2 容量 = 3.2 字）真正生效的样例：句号把长度顶到三段，
+     * 不设门槛时末段会只剩「体积大」三个字 —— 一条字幕闪一下就没有。
+     */
+    const shortTail = breakIntoLines('两套引擎需要若干第三方源码与预编译库。体积大', 32, words)
+    check(
+      '不切出三字以下的孤条',
+      shortTail.length >= 2 && shortTail.every((line) => Array.from(line).length >= 4),
+      JSON.stringify(shortTail),
+    )
+
+    /*
+     * 行首标点由既有断言「标点没被搬到行首或行中」守着，这里不再重复：
+     * 关掉断点强度后它会立刻失败，说明那条是真的有效；本条重写一遍只会变成
+     * 一条永远不会红的摆设。
+     */
+  }
 
   /*
    * 断句质量回归集（2026-11-03 新增）。
@@ -2668,6 +2725,132 @@ const OPT: PunctuationOptions = { zh: 'strip-split', en: 'keep' }
     /to: engine\/xbaos-engine\.exe/.test(readSource('electron-builder.yml')) &&
       /to: engine\/xbaos-engine-asr\.exe/.test(readSource('electron-builder.yml')),
     '少打一个的话，安装后换到另一种架构就没有引擎可用',
+  )
+  /*
+   * Electron 默认分发的 ffmpeg.dll（3.1MB）**含 AAC 与 H.264 解码器**。实测证据：
+   * 把它放进运行时，`decodeAudioData()` 能解 .m4a；换成非专有版（1.6MB）则报
+   * `EncodingError`，同一份 mp3 / flac / ogg / wav 照常解。也就是说「随包携带」
+   * 与「能不能解」是同一件事，删掉这一行就等于重新分发专有编解码器实现。
+   */
+  check(
+    '打包时把 Electron 自带的 ffmpeg 换成非专有版本',
+    /^downloadAlternateFFmpeg:\s*true\s*$/m.test(readSource('electron-builder.yml')),
+    '删掉这一行，ffmpeg.dll 会回到含 AAC / H.264 的版本，等于随包分发专有编解码器实现',
+  )
+  /*
+   * ---- AAC 只走系统解码器（2026-11-15）
+   *
+   * 这是整套 AAC 支持的许可基础：一旦有人把 fdk-aac 之类的实现编进引擎，本软件就从
+   * 「调用操作系统的程序」变成「AAC 产品的实施者」，需要自行取得 Via LA 的专利许可。
+   * 所以这里两头都查：既查系统解码器有没有接上，也查有没有偷偷引入实现。
+   */
+  const engineSources = [
+    'engine/src/audio.hpp',
+    'engine/src/decodecli.hpp',
+    'engine/src/main.cpp',
+    'engine/src/decoders/decoders.cpp',
+    'engine/src/decoders/decoders.hpp',
+    'engine/src/decoders/mfdec.cpp',
+    'engine-onnx/src/main.cpp',
+  ].map((f) => readSource(f))
+  const engineText = engineSources.join('\n')
+  check(
+    '引擎里没有任何 AAC 实现（AAC 只走系统解码器）',
+    !/(fdk[_-]?aac|aacdec|avcodec|libfaad|ff_aac|aac_decoder)/i.test(engineText),
+    '把 AAC 实现编进引擎就是自行分发 AAC 实现，需要专利许可；只能用 Media Foundation',
+  )
+  check(
+    '系统解码器确实接在识别入口上',
+    /MFCreateSourceReaderFromByteStream/.test(readSource('engine/src/decoders/mfdec.cpp')) &&
+      /decodeMediaFoundation/.test(readSource('engine/src/audio.hpp')),
+    '少了这一步，m4a / mp4 / aac 只是「出现在格式表里」，导入时会报无法识别的音频格式',
+  )
+  check(
+    'MP4 与 ADTS 的魔数判别各归各位',
+    /isMp4/.test(readSource('engine/src/audio.hpp')) &&
+      /isAdts/.test(readSource('engine/src/audio.hpp')) &&
+      /\(d\[1\] & 0x06\) != 0/.test(readSource('engine/src/audio.hpp')),
+    'ADTS 与 MP3 共用 0xFF 同步字，只靠 layer 位区分；漏了这条 mask 会把 .aac 当 MP3 解',
+  )
+  const formatsText = readSource('src/utils/formats.ts')
+  const supportedBlock = formatsText.slice(
+    formatsText.indexOf('SUPPORTED_FORMATS'),
+    formatsText.indexOf('UNSUPPORTED_FORMATS'),
+  )
+  check(
+    'M4A / M4B / MP4 / AAC 在支持清单里',
+    ['m4a', 'm4b', 'mp4', 'aac'].every((e) =>
+      new RegExp(`ext: '${e}'`).test(supportedBlock),
+    ),
+    '清单是界面文案与导入校验的唯一来源，漏一个就仍然弹「不支持」',
+  )
+  check(
+    '支持清单里没有「supported: false 的 m4a」',
+    !/ext: 'm4a'[\s\S]{0,120}?supported: false/.test(formatsText),
+    '改口径时最容易只改一处，界面上会出现自相矛盾的两条',
+  )
+  check(
+    '导入 AAC 时先转出一份可播放的 WAV',
+    /'--decode'/.test(readSource('electron/media-cache.js')) &&
+      /needsSystemDecoder/.test(readSource('electron/main.js')),
+    '包内 ffmpeg 解不了 AAC：不转这一份，试听没有声音、波形也是空的',
+  )
+  check(
+    '引擎命令行参数取自宽字符命令行',
+    /CommandLineToArgvW/.test(readSource('engine/src/decodecli.hpp')),
+    'main 的 argv 是 ANSI 代码页（GBK），中文路径到这里已经是乱码',
+  )
+  /*
+   * ---- 视频容器（2026-11-16）
+   *
+   * 只承诺验通过的：MOV / M4V 是 ISO BMFF 同族（mbrand 不同），MKV 是 EBML，
+   * 三者都实测能解出 PCM。AVI 停在「容器能解析、音频取值验不通」这一步；
+   * WebM 的容器同样是 EBML，但音轨必是 Opus / Vorbis，而这两类只有 Ogg 容器
+   * 那份才由自带解码器接手（libopus / stb_vorbis），WebM 只能整段交系统，
+   * 系统又多半没装它的组件。两个都不进支持清单，宁可少支持也不要宣布了却解不出来。
+   */
+  const supportedText = formatsText.slice(
+    formatsText.indexOf('SUPPORTED_FORMATS'),
+    formatsText.indexOf('UNSUPPORTED_FORMATS'),
+  )
+  const unsupportedText = formatsText.slice(formatsText.indexOf('UNSUPPORTED_FORMATS'))
+  check(
+    'MOV / M4V / MKV 在支持清单里，且写明是系统解码器',
+    ['m4v', 'mov', 'mkv'].every((e) =>
+      new RegExp(`ext: '${e}'[\\s\\S]{0,120}?impl: 'Windows 系统解码器'`).test(supportedText),
+    ),
+    '这三个容器里的音轨由系统解，本软件没有可写的库名；写作别的值等于宣称自带实现',
+  )
+  check(
+    'AVI / WebM 停在「不支持」里，并写清真实原因',
+    /ext: 'avi'[\s\S]{0,160}?supported: false/.test(unsupportedText) &&
+      /ext: 'webm'[\s\S]{0,160}?supported: false/.test(unsupportedText),
+    '把没验通的说成支持，用户会遇到「能导入、报错、再问为什么」；原因也不能写成专利，那是不实',
+  )
+  check(
+    '引擎认得 EBML 魔数，但没有接手 AVI',
+    /0x1A && d\[1\] == 0x45/.test(readSource('engine/src/audio.hpp')) &&
+      !/isAvi/.test(readSource('engine/src/audio.hpp')),
+    'EBML 是 MKV / WebM 的共同头；AVI 一旦被认下就会走到「解析成功、取不到音频」那条路',
+  )
+  check(
+    '读文件前先挡体积上限',
+    /kMaxFileBytes/.test(readSource('engine/src/audio.hpp')) &&
+      /文件超过 256 MB/.test(readSource('engine/src/audio.hpp')),
+    '视频文件动辄上 GB，整份读进内存再整段解码，不挡就是 bad_alloc 直接崩',
+  )
+  const cacheExts =
+    readSource('electron/media-cache.js').match(/SYSTEM_DECODER_EXTS = new Set\(\[([^\]]*)\]\)/)?.[1] ??
+    ''
+  check(
+    '试听缓存也认 MKV / MOV / M4V（否则进了编辑器放不出声）',
+    ['mkv', 'mov', 'm4v'].every((e) => cacheExts.includes(`'${e}'`)),
+    'Chromium 解不了这些容器里的音轨，不转 WAV 就是「认得出、听不见、没波形」',
+  )
+  check(
+    '渲染层读的是转好的那份音频',
+    /bridge\.media\.playable\(/.test(readSource('src/stores/project.ts')),
+    '少了这一步，m4a 的 <audio> 会报 DEMUXER_ERROR_NO_SUPPORTED_STREAMS',
   )
   /*
    * ---- 下载完整性（2026-11-04）
@@ -5150,9 +5333,9 @@ const OPT: PunctuationOptions = { zh: 'strip-split', en: 'keep' }
     '直接绑原值的话，勾选显示与导出内容会对不上',
   )
   check(
-    '就地保存与导出用同一口径',
-    editorSrc.includes('settings.speakerPrefixEffective'),
-    '两处各判一次，会出现「导出带标签、按一次保存就把标签抹掉」',
+    '底栏不再有「就地保存」这条第三路',
+    !editorSrc.includes('saveInPlace') && !editorSrc.includes('canSaveInPlace'),
+    '底栏同时摆「保存项目 / 保存 / 导出字幕」时，用户分不清后两个的区别',
   )
 }
 
@@ -5511,8 +5694,9 @@ const OPT: PunctuationOptions = { zh: 'strip-split', en: 'keep' }
     '「保存项目」只存当前项目，「保存全部项目」走小三角',
     /function saveProjectFile\(\): void \{[\s\S]{0,200}?\}/.test(editorSrc) &&
       !/function saveProjectFile[\s\S]{0,200}saveAllProjects/.test(editorSrc) &&
-      // 小三角与主按钮拼成一组（`.btngroup`），点它才知道还有「保存全部」
-      /class="btngroup"[\s\S]{0,800}openSaveMenu[\s\S]{0,300}chevron-down/.test(editorSrc) &&
+      // 小三角与主按钮拼成一组（`.btngroup`），点它才知道还有「保存全部」。
+      // 箭头朝下：这是「展开菜单」的固定符号，不跟着菜单的弹出方向翻转
+      /class="btngroup"[\s\S]{0,800}openSaveMenu[\s\S]{0,400}chevron-down/.test(editorSrc) &&
       /key: 'save-all'/.test(editorSrc),
     '主按钮一下存了别的项目，属于意料之外的副作用',
   )
@@ -6066,10 +6250,12 @@ const OPT: PunctuationOptions = { zh: 'strip-split', en: 'keep' }
     '留着会被撤销栈与草稿各拷一份，而它一旦错位就是全错',
   )
   check(
-    '断点打分把真实停顿算进去',
-    /score \+= Math\.min\(pause, 0\.45\) \* 5000/.test(lineWrapSrc) &&
+    '断点把真实停顿当成独立一档证据',
+    /PAUSE_STRONG/.test(lineWrapSrc) &&
+      /pause >= PAUSE_STRONG/.test(lineWrapSrc) &&
       /pausesOf\(ct, charAt\)/.test(lineWrapSrc),
-    '切点只按宽度填满必然切在句子中间 —— 一句话的尾巴就是这样被扔到下一条的',
+    '停顿过去只是加权求和里的一项（最多 2250 分），能被行首禁则的 −12000 直接盖掉；' +
+      '现在它是字典序比较里的一档，只在词内否决与短行之下',
   )
   check(
     '折行拆分的时间取自逐字时间轴',
@@ -6087,6 +6273,468 @@ const OPT: PunctuationOptions = { zh: 'strip-split', en: 'keep' }
     ),
     '用户建的项目叫「小包听幕介绍」，导出来却叫「合并时间轴.srt」，还得手工改名',
   )
+}
+
+/* ---- 1.3.1：显示方式、通知、保存下拉与「每个项目看到哪儿」 ---- */
+{
+  const src = (rel: string): string => readFileSync(new URL(`../${rel}`, import.meta.url), 'utf8')
+  const thumbSrc = src('src/directives/segThumb.ts')
+  const tableSrc = src('src/components/SubtitleTable.vue')
+  const uiSrc = src('src/stores/ui.ts')
+  const toastSrc = src('src/components/ToastStack.vue')
+  const titleSrc = src('src/components/AppTitlebar.vue')
+  const noticeSrc = src('src/components/NoticeCenter.vue')
+  const editorSrc = src('src/views/EditorView.vue')
+  const trackSrc = src('src/components/TimelineTrack.vue')
+  const projectSrc = src('src/stores/project.ts')
+
+  check(
+    '指示块按 rect 差值定位（不再用整数化的 offsetLeft）',
+    thumbSrc.includes('getBoundingClientRect()') &&
+      thumbSrc.includes('el.clientLeft') &&
+      !/thumb\.style\.left = `\$\{active\.offsetLeft\}/.test(thumbSrc),
+    'offsetLeft 是整数，125%/150% 缩放下会差出 1~2 物理像素，内描边一贴边就露馅',
+  )
+  check(
+    '指示块逐个观察按钮（不只是容器）',
+    /for \(const node of el\.children\)/.test(thumbSrc) && /ro\.observe\(node\)/.test(thumbSrc),
+    '字重变化让某个按钮变宽、容器总宽恰好不变时，只有盯住按钮本身才会重新量',
+  )
+  check(
+    '字体就绪后补量一次',
+    /document\.fonts\?\.ready\.then\(\(\) => measure\(true\)\)/.test(thumbSrc),
+    '内嵌字体是异步交换的，首帧量到的是系统字体的宽度',
+  )
+  /*
+   * 2026-11-14：容器一旦不在布局里（KeepAlive 移出文档 / 窗口最小化 / 祖先隐藏），
+   * 两个 rect 全是 0，差值也是 0 —— 照旧写下去就把指示块扔到左上角，页面回来时
+   * CSS 过渡再从那里滑过来，看着就是「一块底色从左上角飞出来」。
+   */
+  check(
+    '指示块量不到有效几何时不写坐标',
+    /!el\.getClientRects\(\)\.length \|\| !anchored\(el, thumb\)/.test(thumbSrc) &&
+      /if \(box\.width < 1 \|\| box\.height < 1 \|\| rect\.width < 1\)/.test(thumbSrc),
+    '折叠态照旧写 left/top=0，页面回来时就会从左上角滑出来',
+  )
+  check(
+    '从折叠状态回来时必须无动画就位',
+    /__segPending/.test(thumbSrc) && /const jump = !animate \|\| el\.__segPending === true/.test(thumbSrc),
+    '有动画就是从 (0,0) 飞过去，那正是用户看到的那一下',
+  )
+  check(
+    '结构观察忽略指示块自身的 class 变化',
+    /records\.every\(\(r\) => r\.target === thumb\)/.test(thumbSrc),
+    '加 `--jump` 会触发自己这一轮的 MutationObserver，pending 状态下能自激成死循环',
+  )
+  check(
+    '显示方式取「有效值」而不是存的偏好',
+    /const viewMode = computed<SubtitleViewMode>\(\(\) =>[\s\S]{0,120}hasAnyTranslation\.value \? settings\.subtitleView : 'source'/.test(
+      tableSrc,
+    ) && /'is-active': viewMode === opt\.value/.test(tableSrc),
+    '没有译文时偏好可能还停在「双语」，滑块画在双语上，界面就成了「只显示一种语言却标着双语」',
+  )
+  check(
+    '有效值不回写偏好',
+    !/settings\.subtitleView = viewMode/.test(tableSrc),
+    '用户上次选的双语，等这次翻译完还要接着用',
+  )
+  check(
+    '选中条数占固定槽宽',
+    /\.op--count \{[\s\S]{0,160}min-width: 78px/.test(tableSrc),
+    '文案从「未选择」变「已选 12 条」会让宽度跳一下，右边那组分段控件跟着横移',
+  )
+
+  check(
+    '弹出的通知有上限',
+    /export const TOAST_LIMIT = 4/.test(uiSrc) && /slice\(-TOAST_LIMIT\)/.test(uiSrc),
+    '右上角是每个界面都要用的地方，排到第七条就是把界面糊住了',
+  )
+  check(
+    '挤掉的通知仍在通知中心',
+    /notices\.value = \[\.\.\.notices\.value/.test(uiSrc) && /NOTICE_LIMIT/.test(uiSrc),
+    '识别失败这类只有一次机会说明白的事，不能凭「用户大概不看」就丢掉',
+  )
+  check(
+    '接收不到鼠标的通知不留关闭键',
+    /pointer-events: none/.test(toastSrc) && !/toast__close/.test(toastSrc),
+    '留一个点不到的关闭键比没有更糟',
+  )
+  check(
+    '指针靠近即收起（走坐标判定而不是 enter）',
+    /pointermove/.test(toastSrc) &&
+      /nearStack\(event\.clientX/.test(toastSrc) &&
+      !/@mouseenter|addEventListener\('mouseenter'/.test(toastSrc),
+    '通知是后出现在静止指针底下的，浏览器不会补发 enter/leave',
+  )
+  check(
+    '标题栏有通知入口',
+    /NoticeCenter/.test(titleSrc) && /notice__btn/.test(noticeSrc),
+    '弹出的被 4 条上限挤掉之后，用户得有地方找回来看',
+  )
+
+  check(
+    '保存下拉常驻（不再按项目数量开关）',
+    !/v-if="dirtyDrafts\.length > 1"/.test(editorSrc) &&
+      /key: `draft:\$\{d\.id\}`/.test(editorSrc),
+    '只在多项目时才出现，等于让同一个按钮随工程数量变形',
+  )
+  check(
+    '下拉里有「保存全部项目」',
+    /key: 'save-all'/.test(editorSrc) && /保存全部项目/.test(editorSrc),
+  )
+
+  check(
+    '每个项目各记一份时间轴视图',
+    /timelineViewOf/.test(projectSrc) &&
+      /rememberTimelineView/.test(projectSrc) &&
+      /const timelineViews = new Map/.test(projectSrc),
+    '在项目一里放大看断句，切去项目二对照，回来时视窗还停在项目一的位置',
+  )
+  check(
+    '时间轴视图连续写、按绑定的项目写',
+    /watch\(\[zoom, viewStartSec, \(\) => editor\.playheadSec\], persistTimelineView\)/.test(trackSrc) &&
+      /if \(!boundDraftId\) return/.test(trackSrc),
+    '切到空项目时组件会卸载，「切走那一刻记一笔」这一笔会永远丢掉',
+  )
+  check(
+    '组件重新挂载时按记忆摆位',
+    /onMounted\(\(\) => \{[\s\S]{0,160}applyTimelineView\(project\.activeDraftId\)/.test(trackSrc),
+    '空项目再切回来是重新挂载的全新实例，不做这一步永远是「适应宽度 + 播放头在最左」',
+  )
+}
+
+/*
+ * 2026-11-13 · 第二批：通知已读 / 窗口关闭键 / 贴靠浮窗 / 词表扩容
+ */
+{
+  const readSrc = (rel: string): string => readFileSync(new URL(`../${rel}`, import.meta.url), 'utf8')
+  const uiSrc = readSrc('src/stores/ui.ts')
+  const noticeSrc = readSrc('src/components/NoticeCenter.vue')
+  const titleSrc = readSrc('src/components/AppTitlebar.vue')
+  const sidebarSrc = readSrc('src/components/AppSidebar.vue')
+  const tokensSrc = readSrc('src/styles/tokens.css')
+  const globalCss = readSrc('src/styles/global.css')
+  const preloadSrc = readSrc('electron/preload.cjs')
+  const mainSrc = readSrc('electron/main.js')
+  const assistSrc = readSrc('src/views/AssistView.vue')
+  const recordSrc = readSrc('src/views/RecordView.vue')
+  const chromeSrc = readSrc('src/composables/useNativeChrome.ts')
+  const dictSrc = readSrc('src/data/wrapDict.ts')
+  const lexiconSrc = readSrc('src/data/lexicons.ts')
+
+  check(
+    '通知圆点按「看过没有」判断，不按「有没有通知」',
+    /const noticeUnread = computed/.test(uiSrc) &&
+      /latest\.id !== noticeSeenId\.value/.test(uiSrc) &&
+      /v-if="ui\.noticeUnread"/.test(noticeSrc) &&
+      !/v-if="ui\.notices\.length > 0"/.test(noticeSrc),
+    '圆点常亮等于没有提示：用户很快学会无视它，真失败时也看不见',
+  )
+  check(
+    '展开通知中心即记为已读',
+    /function markNoticesSeen/.test(uiSrc) && /ui\.markNoticesSeen\(\)/.test(noticeSrc),
+    '看了却不消失，下一条新通知进来时就没有「有新东西」可言',
+  )
+  check(
+    '关闭键用系统那一档深红，不借危险色',
+    /--color-window-close: #c42b1c/.test(tokensSrc) &&
+      /--color-window-close/.test(titleSrc) &&
+      !/\.titlebar__btn--close:hover\s*\{[^}]*--color-danger/.test(titleSrc),
+    '--color-danger 是「错误提示」语义色，浅一档，贴在窗口角上灰扑扑的',
+  )
+  check(
+    '毛玻璃下标题栏两个功能键同色',
+    /html\.glass \.titlebar__btn,\s*\n?\s*html\.glass \.notice__btn,/.test(globalCss),
+    'glass 模式只给 .titlebar__btn 提了色，铃铛还是 secondary：并排两个键一亮一暗',
+  )
+  check(
+    '侧栏收起时底栏开关居中',
+    /\.sidebar\.is-collapsed \.sidebar__meta\s*\{[^}]*justify-content:\s*center/.test(sidebarSrc),
+    '22px 的开关落在 52px 栏里从左排，比上面那列居中图标偏左 7px，看着像没对齐',
+  )
+  check(
+    '侧栏收起时更新按钮图标居中',
+    /\.sidebar\.is-collapsed \.sidebar__update\s*\{[^}]*gap:\s*0/.test(sidebarSrc),
+    '文字只把 max-width 归零、仍占一个 gap，居中的是「图标 + 间隙」，图标偏左 4px',
+  )
+  check(
+    '侧栏底栏不画分割线',
+    !/\.sidebar__foot\s*\{[^}]*border-top/.test(sidebarSrc),
+    '一条横贯全宽的线把五个入口和开关切成两半，没有分区含义',
+  )
+
+  check(
+    'Windows 上窗口按钮交给系统绘制',
+    /titleBarStyle: 'hidden'/.test(mainSrc) &&
+      /titleBarOverlay: \{/.test(mainSrc) &&
+      /setTitleBarOverlay/.test(mainSrc) &&
+      /nativeChrome: process\.platform === 'win32'/.test(preloadSrc),
+    '自绘按钮系统不认，Windows 11 的贴靠布局永远不会为它弹出',
+  )
+  check(
+    '不再自绘贴靠浮窗',
+    !/SNAP_PRESETS/.test(titleSrc) && !/'window:snap'/.test(preloadSrc) && !/window:snap/.test(mainSrc),
+    '自绘的六宫格在位置、间距、阴影上都对不上系统那个，不如没有',
+  )
+  check(
+    '三个窗口都给系统按钮让出位置',
+    [titleSrc, assistSrc, recordSrc].every((s) => /env\(titlebar-area-width, 100vw\)/.test(s)),
+    '留白漏一个，通知键或置顶键就被压到最大化按钮下面，点不到',
+  )
+  check(
+    '有系统按钮时不再自绘那三个',
+    [titleSrc, assistSrc, recordSrc].every((s) => /v-if="!nativeChrome"/.test(s)),
+    '两套按钮同时在，系统三个与自绘三个并排，点哪个都别扭',
+  )
+  check(
+    '系统按钮的符号色跟着主题走',
+    /--color-text-primary/.test(chromeSrc) &&
+      /setOverlay/.test(chromeSrc) &&
+      /attributeFilter: \['data-theme', 'class'\]/.test(chromeSrc),
+    '系统按钮不认识 CSS 变量：不报色，深色主题下就是一片黑符号',
+  )
+  /*
+   * 2026-11-14：曾为「左上角偶发一块白」把按钮区改成不透明同色，毛玻璃下就是一整块
+   * 实心色块（比那个偶发白块显眼得多），已回退。守回透明：材质与页面底色要透上来。
+   */
+  check(
+    '系统按钮区留透明，让材质透上来',
+    /TITLEBAR_GLASS = '#00000000'/.test(mainSrc) &&
+      /color: TITLEBAR_GLASS/.test(mainSrc) &&
+      !/TITLEBAR_BG/.test(mainSrc),
+    '给不透明底色时毛玻璃下按钮区会变成一块实心色块，与半透明标题栏对不上',
+  )
+
+  check(
+    '通用词表进了断句词表',
+    dictSrc.includes('WRAP_DICT_RAW') &&
+      buildWrapWords([], '').includes('我们') &&
+      buildWrapWords([], '').length > 60000,
+    '三千词覆盖不了日常口播，剩下的切点只能按宽度猜',
+  )
+  check(
+    '通用词表只有 2–6 个汉字',
+    WRAP_DICT_RAW.split(/\s+/)
+      .filter(Boolean)
+      .every((w) => {
+        const n = [...w].length
+        return n >= 2 && n <= 6 && /^[\u4e00-\u9fff]+$/.test(w)
+      }),
+    '单字没有「内部」可言；超过 6 字超出匹配窗口（MAX_WORD_ATOMS）',
+  )
+  check(
+    '词表按「词库勾选 + 手填术语」缓存',
+    /const key = `\$\{lexiconIds\.join/.test(readSrc('src/utils/wrapWords.ts')) &&
+      buildWrapWords([], '') === buildWrapWords([], ''),
+    '七万元素的 Set 每批重建一次要 4ms，而设置整场会话都不变',
+  )
+  check(
+    '领域词库的断句词里放进了专业搭配',
+    /'功耗墙'/.test(lexiconSrc) &&
+      /'边际改善'/.test(lexiconSrc) &&
+      /'打击感'/.test(lexiconSrc) &&
+      buildWrapWords(['tech'], '').includes('功耗墙'),
+    '「功耗 / 墙」「边际 / 改善」正是折行时最容易被劈开的位置',
+  )
+  check(
+    '扩表不改提示词预算',
+    !/wrapDict|WRAP_DICT/.test(readSrc('src/utils/prompt.ts')),
+    '两万条词灌进 initial_prompt 会把预算撑爆，且这些词引擎本来就认得',
+  )
+
+  /*
+   * 非 ASCII 路径（GitHub issue #1）。
+   *
+   * 协议里的路径是 UTF-8，Windows 的窄字符文件 API 走 ANSI 代码页，于是
+   * 「模型就在目录里」和「引擎打不开」同时成立 —— 报错还长成「目录里没有
+   * model.onnx」，把人误导去查模型文件。这里守住三件事：不许再用窄字符
+   * 打开文件、路径必须过 UTF-8 → 宽字符、目录判定按文件系统而不是「能不能
+   * 打开」。
+   */
+  const asrSrc = readSrc('engine-onnx/src/main.cpp')
+  check(
+    'ONNX 引擎不用窄字符文件 API',
+    !/\bfopen\s*\(/.test(asrSrc),
+    '中文目录下 fopen 必然打不开（UTF-8 字节被按 GBK 解释）',
+  )
+  check(
+    'ONNX 引擎的模型路径走 UTF-8 → 宽字符',
+    asrSrc.includes('#include "platform.hpp"') &&
+      (asrSrc.match(/xbaos::pathFromUtf8\(/g) ?? []).length >= 2,
+    'pickFile 与目录判定各需要一次；漏一处就还是打不开中文目录',
+  )
+  check(
+    '目录不存在时不报成「目录里没有模型」',
+    /std::filesystem::is_directory\(probe/.test(asrSrc) && /模型目录不存在/.test(asrSrc),
+    '「目录里没有 model.onnx」这种说法与「文件明明在」互相矛盾，最费排查时间',
+  )
+
+  /*
+   * 2026-11-15 用户报的三处排版 / 交互修正。
+   *
+   * 三条都容易被后来的「顺手重写」抹掉：区间是纯逻辑、平滑是两行像素、对齐
+   * 是半像素。抹掉之后都不报错，只是又变回「两个三角」「画面一顿」「看着歪」。
+   */
+  const seamTableSrc = readSrc('src/components/SubtitleTable.vue')
+  check(
+    '播放指示三角的命中区间左闭右开（接缝处只指下一条）',
+    /t >= s\.start && t < s\.end/.test(seamTableSrc) && !/t <= s\.end/.test(seamTableSrc),
+    '两条首尾相接时游标正站在接缝上，闭区间会同时命中两条，下面冒出两个三角',
+  )
+
+  const followTimelineSrc = readSrc('src/components/TimelineTrack.vue')
+  check(
+    '播放时的视窗是换页，不是被游标推着走',
+    /const FOLLOW_EDGE = 0\.86/.test(followTimelineSrc) &&
+      /const FOLLOW_RETURN = 0\.15/.test(followTimelineSrc) &&
+      /panGoalSec = t - span \* \(jump >= FOLLOW_MIN_JUMP_SEC \? FOLLOW_RETURN : FOLLOW_EDGE\)/.test(
+        followTimelineSrc,
+      ) &&
+      /panGoalSec[\s\S]{0,200}startAnim\(\)/.test(followTimelineSrc),
+    '退回「游标钉在 86% 不动」就是被推着走：画面一刻不停，没有停顿节奏',
+  )
+  check(
+    '视窗太窄时换页退化为连续跟随',
+    /FOLLOW_MIN_JUMP_SEC = 3/.test(followTimelineSrc),
+    '视窗只有几秒宽时每 0.3 秒抽一次，细调会晕',
+  )
+  check(
+    '初次加载按总长给缩放，不硬编 100%',
+    /INITIAL_SPAN_SEC = 60/.test(followTimelineSrc) &&
+      /function initialZoom/.test(followTimelineSrc),
+    '十几分钟的音频用适应宽度，字幕块会挤成一条白线',
+  )
+
+  /*
+   * 2026-11-16 晚的七项修正。
+   *
+   * 共同点：**不报错，但行为不对**。抹掉之后程序照样跑，只有用户会发现
+   * 「波形没变」「字幕卡在导入页」「睡眠后东西没了」。
+   */
+  const projectStoreSrc = readSrc('src/stores/project.ts')
+  const exportDialogSrc = readSrc('src/components/dialogs/ExportDialog.vue')
+  const appSrc = readSrc('src/App.vue')
+
+  check(
+    '重新映射音频后，拼接视图的波形缓存也要作废',
+    /media\.value\.delete\(fileId\)[\s\S]{0,500}media\.value\.delete\(MERGED_FILE_ID\)/.test(
+      projectStoreSrc,
+    ),
+    '只删子项目那条，合并那条还留着上一个文件的形状，波形一动不动',
+  )
+  check(
+    '重新映射后先等新时长回填再拼波形',
+    /await ensureMedia\(fileId\)[\s\S]{0,160}await nextTick\(\)[\s\S]{0,160}syncMergedMedia/.test(
+      projectStoreSrc,
+    ),
+    '时长还是 null 时拼出来的长度是 0，波形会缺一截',
+  )
+  check(
+    '字幕落地按队列顺序，不被待识别音频整体拦住',
+    !/if \(pendingIntake\.value\.length > 0\) return/.test(projectStoreSrc) &&
+      /const barrier = list\.findIndex/.test(projectStoreSrc),
+    '整批拦住就是「混合导入时纯字幕卡在导入页」',
+  )
+  check(
+    '一次导入 = 一个批次，落地时按批次归项目',
+    /batchOf\.set\(f\.id, batch\)/.test(projectStoreSrc) &&
+      /function draftForBatch/.test(projectStoreSrc),
+    '没有批次，同一次导入会被拆成两个项目，或者挂到上一个项目后面',
+  )
+  check(
+    '识别完一个就落地一个，且不逐条重建波形',
+    /landBatch\(\[file\], targetDraftId, false\)/.test(projectStoreSrc),
+    '整批跑完才搬，前几个一直挂在导入页；逐条重建会把每段音频重复解码',
+  )
+  check(
+    '导出弹窗有「连带导出项目音频」，默认关',
+    /const withAudio = ref\(false\)/.test(exportDialogSrc) &&
+      /连带导出项目音频/.test(exportDialogSrc),
+    '默认开会让人莫名其妙多等几十秒',
+  )
+  check(
+    '音频拼接在主进程做，中间文件收尾即删',
+    /concatWav/.test(mainSrc) && /fs\.rm\(p, \{ force: true \}\)/.test(mainSrc),
+    '一小时 48kHz 立体声 690MB，留在临时目录就是垃圾',
+  )
+  check(
+    'WAV 拼接前校验规格一致',
+    /sampleRate !== head\.sampleRate/.test(readSrc('electron/wav-export.js')),
+    '规格不同的段拼在一起会时快时慢，而且不报错',
+  )
+  check(
+    '未保存的工程定期落盘，启动时恢复',
+    /autosave:peek/.test(mainSrc) &&
+      /restoreAutosave/.test(appSrc) &&
+      /startAutosave/.test(appSrc),
+    '睡眠唤醒后渲染进程重载，内存里的成果全没了',
+  )
+  check(
+    '正式保存成功后清掉自动草稿',
+    /autosave\?\.clear\(\)/.test(projectStoreSrc),
+    '不清的话下次启动会冒出一份旧副本，用户会以为项目被改回去了',
+  )
+
+  const capTokensSrc = readSrc('src/styles/tokens.css')
+  const contentCap = Number((capTokensSrc.match(/--content-max-width:\s*(\d+)px/) ?? [])[1])
+  check(
+    '页面内容宽度上限只拦超宽屏，不拦普通屏拉宽',
+    contentCap >= 1600,
+    `当前 ${contentCap}px：按默认窗口配的，窗口一最大化两边就露出死白边`,
+  )
+  check(
+    '导入页设置栏与设置页表单各自放宽到自己的上限',
+    /clamp\(300px, 24vw, 420px\)/.test(readSrc('src/views/HomeView.vue')) &&
+      /\.setmain__inner\s*\{[^}]*max-width:\s*1180px/.test(readSrc('src/views/SettingsView.vue')),
+    '外壳铺满、正文收窄是常规版式；两者都不动就等于「拉宽窗口没用」',
+  )
+
+  const optSidebarSrc = readSrc('src/components/AppSidebar.vue')
+  check(
+    '侧栏版本号补了光学对齐的半像素（用 transform，不用 top）',
+    /\.sidebar__version\s*\{[^}]*transform:\s*translateY\(-0\.5px\)/.test(optSidebarSrc),
+    '数字与 v 都没有下伸部，墨迹中心天生比行盒中心低半格；而 top 会被吸附成整像素，挪半格变挪一格',
+  )
+
+  /*
+   * 滚动条不许吃布局。
+   *
+   * Chromium 的滚动条是占位的：它一出现就从正文里扣掉 10px，面板内容一变长
+   * 正文就被横向挤一下。唯一稳的解法是让槽位常驻（`scrollbar-gutter: stable`），
+   * 所以这条断言扫全仓：**每个会纵向滚的块都必须自带 gutter**。
+   *
+   * 别指望 `--enable-features=OverlayScrollbar`：在主进程里 `appendSwitch`
+   * 对已经初始化过的 feature 列表无效（实测照旧占 15px），打包后开不出来。
+   */
+  {
+    const offenders: string[] = []
+    const scan = (dir: string): void => {
+      for (const name of readdirSync(dir)) {
+        const full = join(dir, name)
+        if (statSync(full).isDirectory()) {
+          scan(full)
+          continue
+        }
+        if (!/\.(vue|css)$/.test(name)) continue
+        const text = readFileSync(full, 'utf8')
+        for (const block of text.match(/\{[^{}]*\}/g) ?? []) {
+          if (!/(^|[\s;])overflow(-y)?\s*:\s*(auto|scroll)\s*;/.test(block)) continue
+          if (/scrollbar-gutter\s*:/.test(block)) continue
+          // 只横向滚的块不吃 gutter：它预留的是右侧 10px，对横向滚动条无用
+          if (/overflow-x\s*:\s*(auto|scroll)\s*;/.test(block) && !/overflow-y\s*:/.test(block)) continue
+          offenders.push(`${full} → ${block.replace(/\s+/g, ' ').slice(0, 60)}`)
+        }
+      }
+    }
+    scan(fileURLToPath(new URL('../src', import.meta.url)))
+    check(
+      '所有纵向滚动容器都预留了滚动条槽位',
+      offenders.length === 0,
+      offenders.length > 0
+        ? `缺 scrollbar-gutter: stable —— ${offenders.slice(0, 3).join(' | ')}`
+        : '内容变长时不再横向挤压正文',
+    )
+  }
 }
 
 /* ---- 引擎文件名按平台分叉（Task 3：mac 无 .exe，win 有 .exe） ---- */

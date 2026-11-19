@@ -26,7 +26,7 @@ function close(): void {
 
 <template>
   <ModalDialog
-    title="支持的音频格式"
+    title="支持的文件格式"
     subtitle="解码全部由本机完成，不联网、不上传"
     width="640px"
     @close="close"
@@ -77,8 +77,10 @@ function close(): void {
       </section>
 
       <p class="formats__note">
-        只采用免费可商用的实现，不内置需付费授权的解码器。上表逐项标明专利状态：
-        AC3 与 EAC3 专利已到期，仅因尚未内置解码器而暂不支持。其余不支持的格式请先转换。
+        自带解码器都是免费可商用的实现。M4A / MP4 / MOV / MKV 各容器里的音轨由
+        Windows 自带的解码器完成，本软件不含这些编码的实现代码，视频轨不解码；
+        Windows N 版或精简系统需先安装媒体功能包。试听与波形用本机转出的一份单声道
+        WAV，原始文件不改动。
       </p>
     </div>
 

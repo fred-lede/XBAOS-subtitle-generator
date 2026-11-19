@@ -6,6 +6,8 @@ import { useSettingsStore } from '@/stores/settings'
 import { useI18n } from '@/composables/useI18n'
 import { branding } from '@/branding'
 import Icon from '@/components/Icon.vue'
+import NoticeCenter from '@/components/NoticeCenter.vue'
+import { useNativeChrome } from '@/composables/useNativeChrome'
 
 const ui = useUiStore()
 const settings = useSettingsStore()
@@ -41,6 +43,15 @@ function windowControl(action: 'minimize' | 'maximize' | 'close'): void {
 }
 
 /**
+ * 标题栏的窗口按钮由系统画还是自己画。
+ *
+ * Windows 上主进程开了 Window Controls Overlay，三个按钮是系统绘制的 ——
+ * 只有这样才能拿到 Windows 11 的贴靠布局（悬停最大化弹出六宫格），
+ * 那个浮窗系统只给它自己的按钮画。浏览器预览没有这层，仍走自绘。
+ */
+const { nativeChrome } = useNativeChrome()
+
+/**
  * 最大化/还原的图标要跟着实际窗口状态走。
  * 光靠点击时翻转本地变量是不行的 —— 用户还可以双击标题栏、
  * 拖到屏幕边缘触发贴靠，这些都绕过了按钮，只能由主进程回推。
@@ -54,7 +65,10 @@ onMounted(() => {
   })
 })
 
-onUnmounted(() => unsubscribeState?.())
+onUnmounted(() => {
+  unsubscribeState?.()
+})
+
 </script>
 
 <template>
@@ -96,36 +110,46 @@ onUnmounted(() => unsubscribeState?.())
         <Icon :name="themeIcon" :size="15" />
       </button>
 
-      <span class="titlebar__sep" aria-hidden="true" />
+      <!-- 通知中心：弹出的通知最多 4 条、靠近就收，看不见的那些在这里 -->
+      <NoticeCenter />
 
-      <button
-        class="titlebar__btn"
-        type="button"
-        title="最小化"
-        aria-label="最小化"
-        @click="windowControl('minimize')"
-      >
-        <Icon name="window-min" :size="15" />
-      </button>
-      <button
-        class="titlebar__btn"
-        type="button"
-        :title="isMaximized ? '还原' : '最大化'"
-        :aria-label="isMaximized ? '还原' : '最大化'"
-        @click="windowControl('maximize')"
-      >
-        <Icon :name="isMaximized ? 'window-restore' : 'window-max'" :size="15" />
-      </button>
-      <button
-        class="titlebar__btn titlebar__btn--close"
-        type="button"
-        title="关闭"
-        aria-label="关闭"
-        @click="windowControl('close')"
-      >
-        <Icon name="x" :size="15" />
-      </button>
+      <!--
+        窗口按钮只在没有系统按钮时才自绘（浏览器预览、非 Windows）。
+        Windows 上交给系统画，才有原生的贴靠布局与悬停效果。
+      -->
+      <template v-if="!nativeChrome">
+        <span class="titlebar__sep" aria-hidden="true" />
+
+        <button
+          class="titlebar__btn"
+          type="button"
+          title="最小化"
+          aria-label="最小化"
+          @click="windowControl('minimize')"
+        >
+          <Icon name="window-min" :size="15" />
+        </button>
+        <button
+          class="titlebar__btn"
+          type="button"
+          :title="isMaximized ? '还原' : '最大化'"
+          :aria-label="isMaximized ? '还原' : '最大化'"
+          @click="windowControl('maximize')"
+        >
+          <Icon :name="isMaximized ? 'window-restore' : 'window-max'" :size="15" />
+        </button>
+        <button
+          class="titlebar__btn titlebar__btn--close"
+          type="button"
+          title="关闭"
+          aria-label="关闭"
+          @click="windowControl('close')"
+        >
+          <Icon name="x" :size="15" />
+        </button>
+      </template>
     </div>
+
   </header>
 </template>
 
@@ -191,6 +215,14 @@ onUnmounted(() => unsubscribeState?.())
   display: flex;
   align-items: center;
   height: 100%;
+  /*
+   * 给系统按钮区让位。
+   *
+   * `env(titlebar-area-width)` 是「系统按钮之外还能用的宽度」，只有开了
+   * Window Controls Overlay 才有值；没有 overlay 时它回落到 100vw，
+   * 这个减法正好是 0 —— 浏览器预览与非 Windows 都不用另写一套。
+   */
+  margin-right: calc(100vw - env(titlebar-area-width, 100vw));
 }
 
 .titlebar__btn {
@@ -208,9 +240,13 @@ onUnmounted(() => unsubscribeState?.())
   color: var(--color-text-primary);
 }
 
+/*
+ * 关闭键的悬停底色固定用系统那一档深红 + 白色叉号。
+ * 不用 `--color-text-inverse`：深色主题里那是「近黑」，压在红底上几乎看不见。
+ */
 .titlebar__btn--close:hover {
-  background: var(--color-danger);
-  color: var(--color-text-inverse);
+  background: var(--color-window-close, #c42b1c);
+  color: #fff;
 }
 
 .titlebar__sep {

@@ -368,7 +368,6 @@ async function launch() {
 /* -------------------------------------------------------------------- 场景 */
 
 const scenarios = {
-  /** preload 桥是否注入了完整的接口 */
   async bridge({ cdp }) {
     const info = await cdp.evaluate(`(() => {
       const api = window.xbaos
@@ -392,6 +391,45 @@ const scenarios = {
     check('拖放取路径接口存在', info.hasPathForFile === true)
     check('系统对话框接口存在', info.hasDialog === true)
     check('接口分组', true, info.groups?.join(', '))
+  },
+
+  /**
+   * 滚动条不吃布局。
+   *
+   * 只断一件事：往固定宽度的滚动容器里塞满内容、逼它出滚动条，容器的 `clientWidth`
+   * 不许变。变窄就说明滚动条又回去占位了 —— 那正是「面板内容一变长、正文被横向
+   * 挤一下」的根因，窄栏里最明显。
+   *
+   * 用应用自己的 `.scroll-y` 建样本，验的就是真实规则，而不是探针另写一份样式。
+   */
+  async scrollbar({ cdp }) {
+    const res = await cdp.evaluate(`(() => {
+      const box = document.createElement('div')
+      box.className = 'scroll-y'
+      box.style.cssText = 'position:fixed;left:-9999px;top:0;width:240px;height:120px'
+      box.innerHTML = '<div style="height:40px">短</div>'
+      document.body.appendChild(box)
+
+      const before = box.clientWidth
+      box.firstElementChild.style.height = '900px'
+      const after = box.clientWidth
+      const out = {
+        before,
+        after,
+        gutter: getComputedStyle(box).scrollbarGutter,
+        scrollable: box.scrollHeight > box.clientHeight,
+      }
+      box.remove()
+      return out
+    })()`)
+
+    check('容器确实滚起来了', res.scrollable === true)
+    check('槽位常驻（scrollbar-gutter: stable）', res.gutter === 'stable', String(res.gutter))
+    check(
+      '滚动条出现时不吃布局',
+      res.before === res.after && res.before > 0,
+      `clientWidth ${res.before} → ${res.after}`,
+    )
   },
 
   /**
@@ -516,6 +554,16 @@ const scenarios = {
         const pinia = document.querySelector('#app').__vue_app__.config.globalProperties.$pinia._s
         const project = pinia.get('project')
         const n = await project.addFilesFromPaths([${JSON.stringify(wav)}])
+        /*
+         * 2.4 起「导入」先进 intake（待识别队列），识别完成后才落进项目。
+         * 这个场景要测的是媒体管线（可播放地址 + 波形），不是批量流程，
+         * 所以手动把这一条搬进 files，省掉跑识别 —— 少一次模型依赖，快几百倍。
+         */
+        const item = project.intake[project.intake.length - 1]
+        if (item) {
+          project.intake.splice(project.intake.indexOf(item), 1)
+          project.files.push(item)
+        }
         const file = project.files[project.files.length - 1]
         if (!file) return { added: 0 }
         await project.ensureMedia(file.id)
@@ -615,8 +663,12 @@ const scenarios = {
           const pinia = document.querySelector('#app').__vue_app__.config.globalProperties.$pinia._s
           const project = pinia.get('project')
           const n = await project.addFilesFromPaths([${JSON.stringify(p)}])
-          const file = project.files[project.files.length - 1]
-          if (!file) return { added: n, imported: false }
+          // 与上面同理：先进 intake，这里手动落进 files 再测媒体管线
+          const item = project.intake[project.intake.length - 1]
+          if (!item) return { added: n, imported: false }
+          project.intake.splice(project.intake.indexOf(item), 1)
+          project.files.push(item)
+          const file = item
           await project.ensureMedia(file.id)
           const m = project.media.get(file.id)
           const out = {
@@ -627,6 +679,8 @@ const scenarios = {
             hasPeaks: !!m?.peaks,
             error: m?.error ?? null,
           }
+          // 探针手动塞进 files 的那条要自己搬走：removeFile 只管 intake 与媒体表
+          project.files.splice(project.files.indexOf(file), 1)
           project.removeFile(file.id)
           return out
         })()`)
@@ -642,7 +696,10 @@ const scenarios = {
         const cleared = await cdp.evaluate(`(() => {
           const pinia = document.querySelector('#app').__vue_app__.config.globalProperties.$pinia._s
           const project = pinia.get('project')
-          project.removeFile(${JSON.stringify(media.id)})
+          const id = ${JSON.stringify(media.id)}
+          const at = project.files.findIndex((f) => f.id === id)
+          if (at >= 0) project.files.splice(at, 1)
+          project.removeFile(id)
           return project.files.length
         })()`)
         check('探针导入的临时条目已移出队列', cleared === 0, `剩 ${cleared} 条`)

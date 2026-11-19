@@ -1,13 +1,11 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { useProjectStore, type ExportRecord } from '@/stores/project'
+import { useProjectStore } from '@/stores/project'
 import { useEditorStore } from '@/stores/editor'
 import { useUiStore } from '@/stores/ui'
 import { useSettingsStore } from '@/stores/settings'
 import { useHistoryStore } from '@/stores/history'
-import { useSpeakerStore } from '@/stores/speakers'
 import { formatDuration } from '@/utils/format'
-import { serializeSubtitle, applyLineEnding } from '@/utils/subtitle'
 import { mergeSelected } from '@/utils/segmentOps'
 import { countIssues, visibleIssues } from '@/utils/validate'
 import { isTypingTarget } from '@/utils/typing'
@@ -15,6 +13,7 @@ import { useSplitAtPlayhead } from '@/composables/useSplitAtPlayhead'
 import { translationLangsOf } from '@/utils/exportPlan'
 import { confirmDestructive } from '@/utils/confirm'
 import { toPlain } from '@/utils/plain'
+import type { MenuItem } from '@/utils/menu'
 import FileTree from '@/components/FileTree.vue'
 import TimelineTrack from '@/components/TimelineTrack.vue'
 import SubtitleTable from '@/components/SubtitleTable.vue'
@@ -29,7 +28,6 @@ const ui = useUiStore()
 const editor = useEditorStore()
 const history = useHistoryStore()
 const settings = useSettingsStore()
-const speakerStore = useSpeakerStore()
 
 /**
  * 当前视图条目。独立模式下是选中的那个文件，合并模式下是拼接产物 ——
@@ -84,10 +82,15 @@ function onKeydown(event: KeyboardEvent): void {
     return
   }
 
-  // Ctrl+S 就地保存：字幕来源的条目，或导出过的条目（编辑文本时也允许保存）
+  /*
+   * Ctrl+S 保存工程。
+   *
+   * 以前这里按「有没有导出过」分岔：有导出记录就覆盖写回字幕文件。底栏去掉
+   * 那个按钮之后，Ctrl+S 只能有一件事可做 —— 存工程。字幕的落地交给导出。
+   */
   if (mod && !event.shiftKey && (key === 's' || key === 'S')) {
     event.preventDefault()
-    if (canSaveInPlace.value) void saveInPlace()
+    saveProjectFile()
     return
   }
 
@@ -439,9 +442,10 @@ const dirtyDrafts = computed(() =>
 )
 
 /**
- * 保存项目（方案 5.3）：主按钮只存**当前**这一个。
- * 同时开着多个、不止一个脏的时候，按钮右侧出小三角，展开「保存全部项目」——
- * 按一下主按钮就把别人也写了，属于意料之外的副作用。
+ * 保存项目：主按钮**只存当前这一个**。
+ *
+ * 按一下主按钮就把别人也写了，属于意料之外的副作用 —— 用户手里那份可能正
+ * 改到一半，不想连它一起落盘。
  */
 function saveProjectFile(): void {
   if (project.projectPath) void project.saveProject()
@@ -451,21 +455,84 @@ function saveProjectFile(): void {
 const saveMenu = ref<{ x: number; y: number } | null>(null)
 
 function openSaveMenu(event: MouseEvent): void {
-  saveMenu.value = { x: event.clientX, y: event.clientY }
+  const rect = (event.currentTarget as HTMLElement).getBoundingClientRect()
+  /*
+   * 往上开，贴着按钮上沿：底栏就在窗口最下边，往下开必然被 UiMenu 夹回来，
+   * 结果是菜单跳到屏幕另一头（落差一下几百像素，看着像点错了东西）。
+   * 高度交给 UiMenu 自己夹 —— 它本来就会把越界的菜单收回视口里。
+   */
+  saveMenu.value = { x: rect.left, y: rect.top - 6 }
 }
 
-function onSaveMenuPick(key: string): void {
+/** 当前是否为脏（活动项目读活引用，其余读草稿自己那一格） */
+function isDirtyDraft(id: string): boolean {
+  const d = project.drafts.find((x) => x.id === id)
+  if (!d) return false
+  return d.id === project.activeDraftId ? project.projectDirty : d.dirty
+}
+
+/**
+ * 保存下拉：常驻，不按项目数量分档。
+ *
+ * 只有一份工程时它显示「保存全部 + 保存这一份」，看着略重复 —— 但那是**稳定**
+ * 的重复；换成「多项目才出现」会让同一个按钮的位置与形状随工程数量变，用户
+ * 每换一次工作现场就要重新找一遍。
+ */
+const saveMenuItems = computed<MenuItem[]>(() => {
+  const dirty = dirtyDrafts.value.length
+  const items: MenuItem[] = [
+    {
+      key: 'save-all',
+      label: '保存全部项目',
+      icon: 'save',
+      hint: dirty > 0 ? `${dirty} 个未保存` : '无改动',
+      disabled: dirty === 0,
+    },
+    { key: 'save-sep', label: '', divider: true },
+  ]
+  for (const d of project.drafts) {
+    /*
+     * 行里只写项目名、不写「保存 某某」：名字本身可能就占满一行（「S03E12 开放式
+     * 耳机横评 等」），再垫两个字会被省略号吃掉，而名字才是唯一能认出是哪一份的
+     * 信息。菜单是从保存按钮上展开的，左边的保存图标已经说明了这一下要做什么。
+     */
+    items.push({
+      key: `draft:${d.id}`,
+      label: project.draftDisplayName(d),
+      icon: 'save',
+      hint: isDirtyDraft(d.id) ? '未保存' : '已保存',
+      // 没改动的不给点：这一项的动作是「写盘」，没东西可写就是空操作
+      disabled: !isDirtyDraft(d.id),
+    })
+  }
+  return items
+})
+
+async function onSaveMenuPick(key: string): Promise<void> {
   saveMenu.value = null
-  if (key === 'save-all') void project.saveAllProjects()
+  if (key === 'save-all') {
+    void project.saveAllProjects()
+    return
+  }
+  const id = key.startsWith('draft:') ? key.slice(6) : ''
+  if (!id) return
+  if (id === project.activeDraftId) {
+    saveProjectFile()
+    return
+  }
+  const target = project.drafts.find((d) => d.id === id)
+  if (!target) return
+  /*
+   * 没落过盘的项目只能先切过去、走一次「存哪儿」—— 保存对话框读的是活动项目的
+   * 状态，替它捏一份上下文比切一下复杂得多，也会让对话框里的名字对不上。
+   */
+  if (!target.path) {
+    if ((await project.switchDraft(id)) === false) return
+    saveProjectFile()
+    return
+  }
+  await project.saveAllProjects([id])
 }
-
-const saveAllItems = computed(() => [
-  {
-    key: 'save-all',
-    label: '保存全部项目',
-    hint: `${dirtyDrafts.value.length} 个`,
-  },
-])
 
 /** 悬停提示：没保存过的项目要说明「这一下会问你存哪」 */
 const saveProjectHint = computed(() =>
@@ -487,117 +554,14 @@ function openExport(): void {
   ui.openDialog('export')
 }
 
-/* ---------------------------------------------------- 字幕文件的保存 */
-
-/**
- * 只有一个子项目时，视图与那一份文件完全重合。
+/*
+ * 这里原本有一套「就地保存」：把当前视图的字幕覆盖写回上次导出的文件。
  *
- * 拼接视图本身不携带 `subtitleFormat` / 导出落点（那两样都属于具体文件），
- * 但项目里只有一份的时候，「这条时间轴」和「那个文件」是同一件事 —— 不认这
- * 一层，导出一个单文件项目之后底栏不会出现「保存」，用户只能再走一遍导出。
- * 多子项目时刻意**不认**：那时底栏保存写的是整条拼接时间轴，往其中任意一份
- * 的路径上写会把别人的内容盖掉。
+ * 2026-11-16 移除。理由是底栏同时出现「保存项目 / 保存 / 导出字幕」三个按钮，
+ * 后两个的差别只在于「写回老文件」还是「另选位置」，用户看不出为什么要分两个。
+ * 现在底栏只留两件事：保存项目（本软件的工程）、导出字幕（交出去就不归我们管）。
  */
-const soloFile = computed(() => (project.files.length === 1 ? project.files[0] : null))
 
-/** 来源是字幕文件（而非音频识别）的条目 */
-const isSubtitleSource = computed(
-  () => !!(activeFile.value?.subtitleFormat ?? soloFile.value?.subtitleFormat),
-)
-
-/**
- * 当前条目上一次导出的文件（内存记录，清空队列即释放）。
- *
- * 有了它，「导出完又改了几个字」就不必重走一遍导出对话框 —— 直接覆盖写回原位。
- * 可能是**多个**文件：「分别导出」会把原文与译文写成两个。
- */
-const exportedRecords = computed(() => {
-  const own = project.exportRecordsOf(project.viewFileId)
-  if (own.length > 0) return own
-  return soloFile.value ? project.exportRecordsOf(soloFile.value.id) : []
-})
-
-/**
- * 能否就地保存。
- *
- * 合并产物是个例外：它的 `path` 借用的是第一个音频，拿它当保存目标会把字幕
- * 写到那个音频旁边，看起来像是另一个文件的产物。所以合并模式下只有「明确
- * 导出过」才提供保存。
- *
- * （原来的「另存为」已去掉：它和「导出字幕」功能重叠，而导出能选目录、格式、
- * 编码与文件名模板，能力更全。）
- */
-const canSaveInPlace = computed(() => {
-  if (project.isMerge) return exportedRecords.value.length > 0
-  return isSubtitleSource.value || exportedRecords.value.length > 0
-})
-
-const saveHint = computed(() => {
-  const list = exportedRecords.value
-  if (list.length === 1) return `覆盖保存到上次导出的文件：${list[0].path}`
-  if (list.length > 1) {
-    return `覆盖保存到上次导出的 ${list.length} 个文件：${list.map((r) => r.path).join('、')}`
-  }
-  return `覆盖保存回原字幕文件：${activeFile.value?.path ?? ''}`
-})
-
-/**
- * 把当前视图的条目写成字幕文件。
- *
- * 格式优先跟随源文件（字幕导入的条目带 `subtitleFormat`）；音频识别出来的条目
- * 没有「原格式」，就跟随导出设置。编码同理：字幕导入时检测到的编码优先，
- * 保证不悄悄换码。
- */
-async function writeSubtitleTo(path: string, record?: ExportRecord): Promise<void> {
-  const file = activeFile.value
-  const bridge = window.xbaos
-  if (!file || !bridge) return
-  const fmt = file.subtitleFormat ?? settings.exportFormat
-  // 带 record 时要**照它原来导出的样子重写**：一份中英对照的字幕，
-  // 不该因为按了一次保存就变成纯中文
-  const body = serializeSubtitle(fmt, file.segments, {
-    lang: record?.bundle ?? 'source',
-    translationLang: record?.lang ?? '',
-    sourceFirst: settings.exportLangSourceFirst,
-    // 导出时带了讲话人标签，就地保存也必须带 —— 否则按一次保存就把标签抹掉了
-    speakerPrefix: settings.speakerPrefixEffective,
-    speakerNames: speakerStore.namesOf(file.id),
-    // 编号是子项目本地的：按条目自己的来源查称呼，别拿一张平表硬套
-    speakerNameOf: (seg) =>
-      speakerStore.nameOf(seg.originFileId ?? file.id, seg.speaker ?? -1),
-  })
-  const content = applyLineEnding(body, settings.exportLineEnding)
-  await bridge.fs.writeSubtitle(path, content, file.sourceEncoding ?? settings.exportEncoding)
-}
-
-/** 就地保存：优先写回上次导出的那些文件，没有就写回字幕源文件 */
-async function saveInPlace(): Promise<void> {
-  const file = activeFile.value
-  if (!file || !canSaveInPlace.value) return
-
-  // 有导出记录就照记录整份重写（分别导出时是多个文件，都要跟上）；
-  // 没有记录时走的是「字幕文件导入」那条路径，写回它自己的原文件
-  const records = exportedRecords.value
-  const targets: ExportRecord[] =
-    records.length > 0 ? records : [{ path: file.path } as ExportRecord]
-  const valid = targets.filter((t) => t.path)
-  if (valid.length === 0) return
-
-  try {
-    for (const target of valid) {
-      await writeSubtitleTo(target.path, records.length > 0 ? target : undefined)
-    }
-    // 登记「这一版内容已经落盘」，关窗时才不会误报未保存
-    project.markSaved(file.id, file.segments)
-    ui.notify(
-      'success',
-      '已保存',
-      valid.length === 1 ? valid[0].path : `${valid.length} 个文件`,
-    )
-  } catch (err) {
-    ui.notify('error', '保存失败', err instanceof Error ? err.message : String(err))
-  }
-}
 </script>
 
 <template>
@@ -762,8 +726,8 @@ async function saveInPlace(): Promise<void> {
 
       <span class="spacer" />
 
-      <!-- 保存：主按钮 + 小三角拼成一组。三角单独立着像个走丢的方块，
-           合并之后一眼看出「更多保存方式」属于保存这一个动作 -->
+      <!-- 保存：主按钮存当前这一个，右侧小三角展开「存哪一个」。
+           三角常驻 —— 只在多项目时才出现，等于让这个按钮随工程数量变形 -->
       <span class="btngroup">
         <button
           class="btn"
@@ -776,26 +740,12 @@ async function saveInPlace(): Promise<void> {
           <span>保存项目</span>
           <span v-if="project.projectDirty" class="editor__dot" aria-hidden="true" />
         </button>
-        <button
-          v-if="dirtyDrafts.length > 1"
-          class="btn"
-          type="button"
-          title="更多保存方式"
-          @click="openSaveMenu"
-        >
+        <button class="btn" type="button" title="保存哪一个项目" @click="openSaveMenu">
+          <!-- 箭头朝下：它是「展开菜单」的固定符号，不随菜单弹出方向翻转。
+               早先跟着「菜单往上开」画成朝上，用户第一眼读成了「收起/返回」 -->
           <Icon name="chevron-down" :size="12" />
         </button>
       </span>
-      <button
-        v-if="canSaveInPlace"
-        class="btn"
-        type="button"
-        :title="saveHint"
-        @click="saveInPlace"
-      >
-        <Icon name="check" :size="14" />
-        <span>保存</span>
-      </button>
       <button class="btn" type="button" @click="openExport">
         <Icon name="download" :size="14" />
         <span>导出字幕</span>
@@ -806,7 +756,7 @@ async function saveInPlace(): Promise<void> {
       v-if="saveMenu"
       :x="saveMenu.x"
       :y="saveMenu.y"
-      :items="saveAllItems"
+      :items="saveMenuItems"
       @close="saveMenu = null"
       @pick="onSaveMenuPick"
     />
@@ -1011,6 +961,7 @@ async function saveInPlace(): Promise<void> {
    */
   max-height: 120px;
   overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 
 .editor__foot > .btn {

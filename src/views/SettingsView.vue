@@ -6,7 +6,7 @@ import { useUiStore } from '@/stores/ui'
 import type { PunctuationMode } from '@/types'
 import { PAUSE_PUNCT_LABELS } from '@/utils/punctuation'
 import { parseReplaceDict } from '@/utils/dictReplace'
-import { buildWrapWords } from '@/utils/wrapWords'
+import { buildWrapWords, wrapDictSize } from '@/utils/wrapWords'
 import { COMMON_WORDS, COMMON_WORD_GROUPS } from '@/data/commonWords'
 import { LEXICONS } from '@/data/lexicons'
 import {
@@ -32,9 +32,11 @@ const ui = useUiStore()
 /** 词表里能解析出多少条可用规则。给个即时反馈，免得手滑写了不生效还不知道 */
 const dictRuleCount = computed(() => parseReplaceDict(settings.dictReplacements).length)
 
-/** 内置词表的规模，界面上直接报数，用户不用点开也心里有数 */
+/** 内置常用词的规模，界面上直接报数，用户不用点开也心里有数 */
 const commonWordCount = COMMON_WORDS.length
 const commonGroupCount = COMMON_WORD_GROUPS.length
+/** 通用词表（jieba 裁剪）的条数 */
+const dictWordCount = wrapDictSize()
 /** 显卡加速是否可用：由当前模型架构决定，见 stores/model.ts */
 const canUseGpu = computed(() => model.caps.gpu)
 
@@ -870,6 +872,10 @@ function reset(): void {
                     <span class="wb-stat__label">常用词</span>
                   </div>
                   <div class="wb-stat">
+                    <span class="wb-stat__num">{{ dictWordCount }}</span>
+                    <span class="wb-stat__label">通用词表</span>
+                  </div>
+                  <div class="wb-stat">
                     <span class="wb-stat__num">{{ commonGroupCount }}</span>
                     <span class="wb-stat__label">常用词类别</span>
                   </div>
@@ -1047,6 +1053,7 @@ function reset(): void {
   width: 300px;
   max-height: 320px;
   overflow-y: auto;
+  scrollbar-gutter: stable;
   padding: var(--space-1);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
@@ -1172,6 +1179,7 @@ function reset(): void {
   flex: 1;
   min-width: 0;
   overflow-y: auto;
+  scrollbar-gutter: stable;
   /* 顶部取 space-3：与左侧搜索框的上内边距同值，两者顶边才对得齐 */
   padding: var(--space-3) var(--space-6) var(--space-6);
 }
@@ -1179,11 +1187,16 @@ function reset(): void {
 .setmain__inner {
   width: 100%;
   /*
-   * 980px 不是随手取的：窗口 − 主侧栏 208 − 分组栏 196 − 左右内边距 48，
-   * 默认 1480 窗口下可用 1028 —— 取 980 让表单在常见宽度下不被拉成超长单行，
-   * 同时右侧仍留一点余量，窄窗自动收窄。
+   * 表单的**可读宽度**上限，与页面外壳的 `--content-max-width` 分开管。
+   *
+   * 旧值 980 是按「默认窗口 1360 − 侧栏 208 − 分组栏 196 − 内边距 48 = 908」
+   * 配的 —— 默认窗口下确实刚好，但窗口一拉宽表单就不动了，右侧留出一大片空。
+   * 提到 1180：表单里那些 `1fr 1fr` / `repeat(3, 1fr)` 的栅格会跟着长，宽屏下
+   * 一行能读完的项就不用折行。再宽下去单行文字会太长（扫读时找不到下一行的
+   * 起点），所以到 1180 为止 —— 它比外壳的 1760 小，正是「外壳铺满、正文收窄」
+   * 这个常规版式。
    */
-  max-width: 980px;
+  max-width: 1180px;
   margin: 0 auto;
 }
 
@@ -1221,7 +1234,7 @@ function reset(): void {
 /* ---- 内置词表：数字概览 ---- */
 .wb-stats {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(5, 1fr);
   gap: var(--space-3);
   margin: var(--space-3) 0;
 }
